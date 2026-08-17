@@ -88,8 +88,9 @@ In every mode except **Full access**, each permission prompt Hermes raises — f
 paths, and anything else it asks about — surfaces in T3 Code and waits for you to approve or reject
 it.
 
-In **Full access**, T3 Code answers those prompts for you. It prefers Hermes' "always allow" option
-when Hermes offers one, and Hermes may remember that choice for later.
+In **Full access**, T3 Code answers those prompts for you by selecting Hermes' session-scoped
+`allow_session` option. The approval lasts only for the active Hermes session; T3 Code never adds
+permissions to Hermes' permanent allowlist.
 
 ## Troubleshooting
 
