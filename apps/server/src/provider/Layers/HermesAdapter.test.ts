@@ -606,7 +606,7 @@ it.layer(hermesAdapterTestLayer)("HermesAdapterLive", (it) => {
     }),
   );
 
-  it.effect("auto-approves permission requests in full-access mode", () =>
+  it.effect("auto-approves permission requests for the session in full-access mode", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("hermes-full-access-auto-approval");
       const tempDir = yield* Effect.promise(() =>
@@ -642,7 +642,7 @@ it.layer(hermesAdapterTestLayer)("HermesAdapterLive", (it) => {
         .filter((type) => type === "request.opened" || type === "request.resolved");
 
       assert.deepEqual(requestEventTypes, []);
-      assert.deepEqual(selectedPermissionOptionIds(requests), ["allow_always"]);
+      assert.deepEqual(selectedPermissionOptionIds(requests), ["allow_session"]);
 
       yield* Fiber.interrupt(runtimeEventsFiber);
       yield* adapter.stopSession(threadId);

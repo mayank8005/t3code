@@ -24,7 +24,7 @@ import {
 } from "./TextGenerationUtils.ts";
 
 const HERMES_TIMEOUT_MS = 180_000;
-const NO_TOOLS_TOOLSET = "t3-text-generation-no-tools";
+const HERMES_TEXT_GENERATION_TOOLSET = "todo";
 
 type TextGenerationOperation =
   | "generateCommitMessage"
@@ -82,7 +82,7 @@ export const makeHermesTextGeneration = Effect.fn("makeHermesTextGeneration")(fu
       const command = hermesSettings.binaryPath || "hermes";
       const args = [
         "--toolsets",
-        NO_TOOLS_TOOLSET,
+        HERMES_TEXT_GENERATION_TOOLSET,
         "--ignore-rules",
         ...resolveHermesModelArgs(input.modelSelection.model),
         "--oneshot",

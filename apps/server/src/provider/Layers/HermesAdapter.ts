@@ -158,7 +158,6 @@ function selectAutoApprovedPermissionOption(
   request: EffectAcpSchema.RequestPermissionRequest,
 ): string | undefined {
   return (
-    request.options.find((entry) => entry.optionId.trim() === "allow_always")?.optionId ??
     selectPermissionOptionId(request, "acceptForSession") ??
     selectPermissionOptionId(request, "accept")
   );

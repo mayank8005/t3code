@@ -37,6 +37,18 @@ function makeHermesWrapper(
     hermesPath,
     [
       "#!/bin/sh",
+      "valid_toolset=",
+      "previous=",
+      'for arg in "$@"; do',
+      '  if [ "$previous" = "--toolsets" ] && [ "$arg" = "todo" ]; then',
+      "    valid_toolset=1",
+      "  fi",
+      '  previous="$arg"',
+      "done",
+      'if [ "$valid_toolset" != "1" ]; then',
+      '  printf "%s" "hermes -z: --toolsets did not contain any valid toolsets." >&2',
+      "  exit 2",
+      "fi",
       ...(input.argsPath ? [`printf "%s\\0" "$@" > ${shellSingleQuote(input.argsPath)}`] : []),
       `printf "%s" ${shellSingleQuote(input.output)}`,
       `exit ${input.exitCode ?? 0}`,
@@ -69,7 +81,7 @@ function readArgs(filePath: string): ReadonlyArray<string> {
 }
 
 it.layer(HermesTextGenerationTestLayer)("HermesTextGeneration", (it) => {
-  it.effect("uses one-shot mode without agent tools and forwards provider + model", () => {
+  it.effect("uses one-shot mode with a restricted Hermes toolset and forwards the model", () => {
     const argsDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3code-hermes-args-"));
     const argsPath = NodePath.join(argsDir, "args");
     return withFakeHermes(
@@ -97,7 +109,10 @@ it.layer(HermesTextGenerationTestLayer)("HermesTextGeneration", (it) => {
           const args = readArgs(argsPath);
           expect(args).toContain("--oneshot");
           expect(args).toContain("--ignore-rules");
-          expect(args).toContain("t3-text-generation-no-tools");
+          expect(args.slice(args.indexOf("--toolsets"), args.indexOf("--toolsets") + 2)).toEqual([
+            "--toolsets",
+            "todo",
+          ]);
           expect(args).not.toContain("acp");
           expect(args.slice(args.indexOf("--provider"), args.indexOf("--provider") + 4)).toEqual([
             "--provider",
