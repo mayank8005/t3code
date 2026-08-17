@@ -39,16 +39,12 @@ const failPrompt = process.env.T3_ACP_FAIL_PROMPT === "1";
 const failSetConfigOption = process.env.T3_ACP_FAIL_SET_CONFIG_OPTION === "1";
 const exitOnSetConfigOption = process.env.T3_ACP_EXIT_ON_SET_CONFIG_OPTION === "1";
 const promptResponseText = process.env.T3_ACP_PROMPT_RESPONSE_TEXT;
-// Generic surface overrides for agents whose ACP handshake differs from the
-// defaults below: `T3_ACP_AUTH_METHODS` is a JSON `AuthMethod[]` advertised
-// from `initialize`, and `T3_ACP_SESSION_MODELS` is a JSON `ModelInfo[]`
-// replacing the built-in model catalog (session setup then omits
-// `configOptions`, matching agents like Hermes that expose none).
 const authMethodsJson = process.env.T3_ACP_AUTH_METHODS;
 const sessionModelsJson = process.env.T3_ACP_SESSION_MODELS;
 const promptDelayMs = Number(process.env.T3_ACP_PROMPT_DELAY_MS ?? "0");
 const permissionOptionIds = {
   allowOnce: process.env.T3_ACP_ALLOW_ONCE_OPTION_ID ?? "allow-once",
+  allowSession: process.env.T3_ACP_ALLOW_SESSION_OPTION_ID,
   allowAlways: process.env.T3_ACP_ALLOW_ALWAYS_OPTION_ID ?? "allow-always",
   rejectOnce: process.env.T3_ACP_REJECT_ONCE_OPTION_ID ?? "reject-once",
 };
@@ -696,6 +692,15 @@ const program = Effect.gen(function* () {
           },
           options: [
             { optionId: permissionOptionIds.allowOnce, name: "Allow once", kind: "allow_once" },
+            ...(permissionOptionIds.allowSession
+              ? [
+                  {
+                    optionId: permissionOptionIds.allowSession,
+                    name: "Allow for session",
+                    kind: "allow_always" as const,
+                  },
+                ]
+              : []),
             {
               optionId: permissionOptionIds.allowAlways,
               name: "Allow always",

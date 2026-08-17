@@ -58,34 +58,26 @@ display name and accent color so they are easy to tell apart in the model picker
 
 ## Models
 
-Hermes has no fixed model list. T3 Code asks Hermes for its models when it connects, so the picker
-shows exactly what your own Hermes configuration exposes.
+Hermes has no fixed model list. The picker includes **Hermes default**, which keeps the model
+configured in Hermes. Manage that model with `hermes model`.
 
-Model ids are `provider:model` pairs, for example:
+Add an explicit model id in the provider's Models section in Settings when you want another picker
+choice. Model ids use `provider:model`, for example:
 
 ```text
 openrouter:qwen/qwen3-coder
 ```
 
-The picker groups models by the part before the colon, so everything behind one backing provider
-stays together.
-
-Selecting `default` does not pick a model. It keeps whatever model Hermes is already configured
-with, which is what you want if you manage models through `hermes model`.
-
 Switching models mid-thread works. T3 Code changes the model on the running Hermes session, so you
 do not have to start a new thread.
-
-If Hermes exposes a model T3 Code did not discover, add the slug by hand in the provider's Models
-section in Settings.
 
 ## Signing In
 
 Hermes owns its own authentication. There is no Hermes login button in T3 Code.
 
-T3 Code reports Hermes as authenticated or unauthenticated based on what `hermes acp` advertises
-when it starts. If Settings shows Hermes as unauthenticated, run `hermes setup` in a terminal, then
-refresh provider status.
+Provider status checks whether the CLI and its ACP support are installed. Hermes validates model
+credentials when a session starts. If a session reports an authentication error, configure Hermes
+with `hermes setup` in a terminal and try again.
 
 ## Permission Modes
 
@@ -107,8 +99,7 @@ T3 Code could not run `hermes` at all. Install the CLI, or set `Binary path` to 
 the `hermes` executable. If you installed Hermes in a shell whose PATH the T3 Code server does not
 inherit, the absolute path is the quicker fix.
 
-**"Hermes is installed but `hermes acp` failed to start. Install the ACP extra
-(`cd ~/.hermes/hermes-agent && uv pip install -e '.[acp]'`) and check server logs."**
+**"Hermes is installed without ACP support. Install the ACP extra..."**
 
 Hermes runs, but its ACP server does not. This is almost always the missing ACP extra:
 
@@ -116,11 +107,11 @@ Hermes runs, but its ACP server does not. This is almost always the missing ACP 
 cd ~/.hermes/hermes-agent && uv pip install -e '.[acp]'
 ```
 
-Refresh provider status afterwards. If it still fails, run `hermes acp` in a terminal and read the
-error it prints.
+Refresh provider status afterwards. If it still fails, run `hermes acp --check` in a terminal and
+read the error it prints.
 
-**"Hermes has no model provider configured. Run `hermes setup` (or `hermes model`) and try again."**
+**"Hermes ACP health check failed. Run `hermes acp --check` for details."**
 
-Hermes started, but it has no credentials for any model provider, so there is nothing to run a turn
-with. Run `hermes setup` (or `hermes setup --portal`), pick models with `hermes model`, then refresh
-provider status.
+The CLI is installed, but its ACP self-check reported another problem. Run the command directly for
+the specific error. Provider or model authentication errors appear when a Hermes session starts;
+resolve those with `hermes setup` or `hermes model`.

@@ -33,9 +33,6 @@ const __dirname = NodePath.dirname(NodeURL.fileURLToPath(import.meta.url));
 const mockAgentPath = NodePath.join(__dirname, "../../../scripts/acp-mock-agent.ts");
 const mockAgentCommand = process.execPath;
 
-// Hermes advertises its configured model provider as an agent-managed auth
-// method next to the always-present `hermes-setup` terminal method, and
-// exposes models through `SessionModelState` instead of config options.
 const HERMES_SESSION_MODELS_JSON = JSON.stringify([
   { modelId: "openrouter:qwen/qwen3-coder", name: "Qwen3 Coder" },
   { modelId: "openrouter:moonshotai/kimi-k2", name: "Kimi K2" },
@@ -57,6 +54,10 @@ async function makeMockHermesWrapper(extraEnv?: Record<string, string>) {
   const envExports = Object.entries({
     T3_ACP_SESSION_MODELS: HERMES_SESSION_MODELS_JSON,
     T3_ACP_AUTH_METHODS: HERMES_AUTH_METHODS_JSON,
+    T3_ACP_ALLOW_ONCE_OPTION_ID: "allow_once",
+    T3_ACP_ALLOW_SESSION_OPTION_ID: "allow_session",
+    T3_ACP_ALLOW_ALWAYS_OPTION_ID: "allow_always",
+    T3_ACP_REJECT_ONCE_OPTION_ID: "deny",
     ...extraEnv,
   })
     .map(([key, value]) => `export ${key}=${JSON.stringify(value)}`)
@@ -230,6 +231,71 @@ it.layer(hermesAdapterTestLayer)("HermesAdapterLive", (it) => {
 
       yield* adapter.stopSession(threadId);
     }),
+  );
+
+  it.effect("routes an in-flight follow-up through Hermes steering", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("hermes-steer-in-flight-turn");
+      const tempDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "hermes-acp-steer-")),
+      );
+      const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockHermesWrapper({
+          T3_ACP_PROMPT_DELAY_MS: "1000",
+          T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+        }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("hermes"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      const firstTurnFiber = yield* adapter
+        .sendTurn({ threadId, input: "start the task", attachments: [] })
+        .pipe(Effect.forkChild);
+      let activeSession = (yield* adapter.listSessions()).find(
+        (session) => session.threadId === threadId && session.activeTurnId !== undefined,
+      );
+      for (let attempt = 0; attempt < 20 && !activeSession; attempt += 1) {
+        yield* Effect.yieldNow;
+        activeSession = (yield* adapter.listSessions()).find(
+          (session) => session.threadId === threadId && session.activeTurnId !== undefined,
+        );
+      }
+      const turnId = activeSession?.activeTurnId;
+      assert.isDefined(turnId);
+      yield* waitForFileContent(requestLogPath, 40, "start the task");
+      const followUp = yield* adapter
+        .sendTurn({ threadId, input: "focus on the tests", attachments: [] })
+        .pipe(Effect.timeout("4 seconds"));
+      yield* waitForFileContent(requestLogPath, 40, "/steer focus on the tests");
+
+      const requests = yield* Effect.promise(() => readJsonLines(requestLogPath));
+      const promptTexts = requests.flatMap((request) => {
+        if (request.method !== "session/prompt" || !Array.isArray(request.params?.prompt)) {
+          return [];
+        }
+        return request.params.prompt.flatMap((part) =>
+          typeof part === "object" &&
+          part !== null &&
+          "type" in part &&
+          part.type === "text" &&
+          "text" in part &&
+          typeof part.text === "string"
+            ? [part.text]
+            : [],
+        );
+      });
+      assert.equal(followUp.turnId, turnId);
+      assert.include(promptTexts, "/steer focus on the tests");
+
+      yield* Fiber.join(firstTurnFiber);
+      yield* adapter.stopSession(threadId);
+    }).pipe(TestClock.withLive),
   );
 
   it.effect("authenticates with the advertised provider method and sets the requested model", () =>
@@ -482,7 +548,7 @@ it.layer(hermesAdapterTestLayer)("HermesAdapterLive", (it) => {
 
       assert.equal(requestResolvedEvent.payload.decision, "accept");
       assert.equal(String(requestResolvedEvent.requestId), String(requestOpenedEvent.requestId));
-      assert.deepEqual(selectedPermissionOptionIds(requests), ["allow-once"]);
+      assert.deepEqual(selectedPermissionOptionIds(requests), ["allow_once"]);
       assert.equal(readySession?.status, "ready");
       assert.isUndefined(readySession?.activeTurnId);
 
@@ -533,7 +599,7 @@ it.layer(hermesAdapterTestLayer)("HermesAdapterLive", (it) => {
       const requests = yield* Effect.promise(() => readJsonLines(requestLogPath));
 
       assert.equal(requestResolvedEvent.payload.decision, "decline");
-      assert.deepEqual(selectedPermissionOptionIds(requests), ["reject-once"]);
+      assert.deepEqual(selectedPermissionOptionIds(requests), ["deny"]);
 
       yield* Fiber.interrupt(eventsFiber);
       yield* adapter.stopSession(threadId);
@@ -576,14 +642,14 @@ it.layer(hermesAdapterTestLayer)("HermesAdapterLive", (it) => {
         .filter((type) => type === "request.opened" || type === "request.resolved");
 
       assert.deepEqual(requestEventTypes, []);
-      assert.deepEqual(selectedPermissionOptionIds(requests), ["allow-always"]);
+      assert.deepEqual(selectedPermissionOptionIds(requests), ["allow_always"]);
 
       yield* Fiber.interrupt(runtimeEventsFiber);
       yield* adapter.stopSession(threadId);
     }),
   );
 
-  it.effect("responds to ACP approvals using provider-supplied option ids", () =>
+  it.effect("responds to ACP approvals using Hermes option ids", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("hermes-custom-approval-option-id");
       const tempDir = yield* Effect.promise(() =>
@@ -594,7 +660,6 @@ it.layer(hermesAdapterTestLayer)("HermesAdapterLive", (it) => {
         makeMockHermesWrapper({
           T3_ACP_REQUEST_LOG_PATH: requestLogPath,
           T3_ACP_EMIT_TOOL_CALLS: "1",
-          T3_ACP_ALLOW_ONCE_OPTION_ID: "agent-defined-approval-id",
         }),
       );
       const adapter = yield* makeTestAdapter(wrapperPath);
@@ -617,7 +682,47 @@ it.layer(hermesAdapterTestLayer)("HermesAdapterLive", (it) => {
       yield* adapter.sendTurn({ threadId, input: "approve this", attachments: [] });
 
       const requests = yield* Effect.promise(() => readJsonLines(requestLogPath));
-      assert.deepEqual(selectedPermissionOptionIds(requests), ["agent-defined-approval-id"]);
+      assert.deepEqual(selectedPermissionOptionIds(requests), ["allow_once"]);
+
+      yield* Fiber.interrupt(eventsFiber);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("selects Hermes' session-scoped approval independently of permanent approval", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("hermes-session-approval-option-id");
+      const tempDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "hermes-acp-session-approval-")),
+      );
+      const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockHermesWrapper({
+          T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+          T3_ACP_EMIT_TOOL_CALLS: "1",
+        }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        event.type === "request.opened"
+          ? adapter.respondToRequest(
+              threadId,
+              ApprovalRequestId.make(String(event.requestId)),
+              "acceptForSession",
+            )
+          : Effect.void,
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("hermes"),
+        cwd: process.cwd(),
+        runtimeMode: "approval-required",
+      });
+      yield* adapter.sendTurn({ threadId, input: "approve this session", attachments: [] });
+
+      const requests = yield* Effect.promise(() => readJsonLines(requestLogPath));
+      assert.deepEqual(selectedPermissionOptionIds(requests), ["allow_session"]);
 
       yield* Fiber.interrupt(eventsFiber);
       yield* adapter.stopSession(threadId);
@@ -1226,15 +1331,6 @@ it.layer(hermesAdapterTestLayer)("HermesAdapterLive", (it) => {
     }),
   );
 
-  // Production calls startSession from a request fiber that finishes as soon as
-  // the session exists. `Effect.forkChild` made the notification consumer a
-  // child of that fiber, and Effect interrupts a fiber's children when it
-  // completes, so the consumer died on return and every later session/update
-  // was dropped: the thread sat on "Working" forever while the provider
-  // streamed its whole turn. Every other test here calls startSession directly
-  // from the test fiber, which never completes, so the consumer survived and
-  // the bug stayed invisible. Running it in a fiber that finishes is what
-  // reproduces production.
   it.effect("keeps consuming notifications after the startSession fiber completes", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("hermes-consumer-outlives-start-session");
@@ -1265,9 +1361,6 @@ it.layer(hermesAdapterTestLayer)("HermesAdapterLive", (it) => {
         .pipe(Effect.forkChild);
       yield* Fiber.join(startSessionFiber).pipe(Effect.timeout("10 seconds"));
 
-      // Forked, and the assertion waits on the projected event rather than on
-      // sendTurn: with the consumer dead the turn never settles, so awaiting it
-      // directly would hang until the suite timeout instead of failing here.
       const sendTurnFiber = yield* adapter
         .sendTurn({ threadId, input: "hello hermes", attachments: [] })
         .pipe(Effect.forkChild);
@@ -1287,9 +1380,6 @@ it.layer(hermesAdapterTestLayer)("HermesAdapterLive", (it) => {
 
       yield* Fiber.interrupt(runtimeEventsFiber);
       yield* adapter.stopSession(threadId);
-      // Live clock so the timeouts above are real: under the default test clock
-      // they wait on virtual time that never advances, and a regression would
-      // hang until the suite timeout instead of failing here.
     }).pipe(TestClock.withLive),
   );
 });

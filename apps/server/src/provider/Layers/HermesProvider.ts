@@ -2,15 +2,11 @@ import {
   type HermesSettings,
   type ModelCapabilities,
   type ServerProvider,
-  type ServerProviderAuth,
   type ServerProviderModel,
 } from "@t3tools/contracts";
-import type * as EffectAcpSchema from "effect-acp/schema";
 import { causeErrorTag } from "@t3tools/shared/observability";
-import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
-import * as Exit from "effect/Exit";
 import * as Option from "effect/Option";
 import * as Result from "effect/Result";
 import { HttpClient } from "effect/unstable/http";
@@ -30,8 +26,6 @@ import {
   enrichProviderSnapshotWithVersionAdvisory,
   type ProviderMaintenanceCapabilities,
 } from "../providerMaintenance.ts";
-import { HERMES_SETUP_AUTH_METHOD_ID, makeHermesAcpRuntime } from "../acp/HermesAcpSupport.ts";
-
 const HERMES_PRESENTATION = {
   displayName: "Hermes",
   badgeLabel: "Early Access",
@@ -40,11 +34,16 @@ const HERMES_PRESENTATION = {
 const EMPTY_CAPABILITIES: ModelCapabilities = createModelCapabilities({
   optionDescriptors: [],
 });
+const HERMES_DEFAULT_MODEL: ServerProviderModel = {
+  slug: "default",
+  name: "Hermes default",
+  isDefault: true,
+  isCustom: false,
+  capabilities: EMPTY_CAPABILITIES,
+};
 
-/** `hermes --version` boots a Python CLI, so it gets more room than Grok's. */
 const VERSION_PROBE_TIMEOUT_MS = 8_000;
-/** `hermes acp` loads the full Hermes runtime before answering `initialize`. */
-const HERMES_ACP_DISCOVERY_TIMEOUT_MS = 20_000;
+const HERMES_ACP_CHECK_TIMEOUT_MS = 8_000;
 
 export function buildInitialHermesProviderSnapshot(
   hermesSettings: HermesSettings,
@@ -87,95 +86,9 @@ export function buildInitialHermesProviderSnapshot(
 
 function hermesModelsFromSettings(
   customModels: ReadonlyArray<string> | undefined,
-  builtInModels: ReadonlyArray<ServerProviderModel> = [],
 ): ReadonlyArray<ServerProviderModel> {
-  return providerModelsFromSettings(builtInModels, customModels ?? [], EMPTY_CAPABILITIES);
+  return providerModelsFromSettings([HERMES_DEFAULT_MODEL], customModels ?? [], EMPTY_CAPABILITIES);
 }
-
-/**
- * Derive auth status from the `authMethods` a Hermes `initialize` response
- * advertises. Hermes lists the configured model provider as an
- * agent-managed method when runtime credentials exist; a response carrying
- * only the `hermes-setup` terminal method means nothing is configured yet.
- */
-export function parseHermesAuthFromAuthMethods(
-  authMethods: ReadonlyArray<EffectAcpSchema.AuthMethod> | null | undefined,
-): ServerProviderAuth {
-  for (const method of authMethods ?? []) {
-    const id = method.id.trim();
-    if (!id || id === HERMES_SETUP_AUTH_METHOD_ID) {
-      continue;
-    }
-    const label = method.name.trim();
-    return {
-      status: "authenticated",
-      type: id,
-      ...(label ? { label } : {}),
-    };
-  }
-  return { status: "unauthenticated" };
-}
-
-/**
- * Map a Hermes ACP `SessionModelState` to picker models. Hermes model ids
- * use the `provider:model` encoding produced by its `_encode_model_choice`;
- * the provider prefix is surfaced as `subProvider` so the picker can group
- * entries by the backing provider.
- */
-export function buildHermesModelsFromSessionModelState(
-  modelState: EffectAcpSchema.SessionModelState | null | undefined,
-): ReadonlyArray<ServerProviderModel> {
-  if (!modelState || modelState.availableModels.length === 0) {
-    return [];
-  }
-  const seen = new Set<string>();
-  return modelState.availableModels
-    .map((model): ServerProviderModel | undefined => {
-      const slug = model.modelId.trim();
-      if (!slug || seen.has(slug)) {
-        return undefined;
-      }
-      seen.add(slug);
-      const separatorIndex = slug.indexOf(":");
-      const subProvider =
-        separatorIndex > 0 && separatorIndex < slug.length - 1
-          ? slug.slice(0, separatorIndex)
-          : undefined;
-      return {
-        slug,
-        name: model.name.trim() || slug,
-        ...(subProvider ? { subProvider } : {}),
-        isCustom: false,
-        capabilities: EMPTY_CAPABILITIES,
-      };
-    })
-    .filter((model): model is ServerProviderModel => model !== undefined);
-}
-
-interface HermesAcpDiscoveryResult {
-  readonly auth: ServerProviderAuth;
-  readonly models: ReadonlyArray<ServerProviderModel>;
-}
-
-const discoverHermesViaAcp = (
-  hermesSettings: HermesSettings,
-  environment: NodeJS.ProcessEnv = process.env,
-) =>
-  Effect.gen(function* () {
-    const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-    const acp = yield* makeHermesAcpRuntime({
-      hermesSettings,
-      environment,
-      childProcessSpawner,
-      cwd: process.cwd(),
-      clientInfo: { name: "t3-code-provider-probe", version: "0.0.0" },
-    });
-    const started = yield* acp.start();
-    return {
-      auth: parseHermesAuthFromAuthMethods(started.initializeResult.authMethods),
-      models: buildHermesModelsFromSessionModelState(started.sessionSetupResult.models),
-    } satisfies HermesAcpDiscoveryResult;
-  }).pipe(Effect.scoped);
 
 const runHermesVersionCommand = (
   hermesSettings: HermesSettings,
@@ -195,14 +108,42 @@ const runHermesVersionCommand = (
     );
   });
 
+const runHermesAcpCheckCommand = (
+  hermesSettings: HermesSettings,
+  environment: NodeJS.ProcessEnv = process.env,
+) =>
+  Effect.gen(function* () {
+    const command = hermesSettings.binaryPath || "hermes";
+    const probeEnvironment = {
+      ...environment,
+      HERMES_ACP_SKIP_CONFIGURED_MCP: "1",
+    };
+    const args = ["acp", "--check"];
+    const spawnCommand = yield* resolveSpawnCommand(command, args, { env: probeEnvironment });
+    return yield* spawnAndCollect(
+      command,
+      ChildProcess.make(spawnCommand.command, spawnCommand.args, {
+        env: probeEnvironment,
+        shell: spawnCommand.shell,
+      }),
+    );
+  });
+
+function hermesAcpCheckFailureMessage(stdout: string, stderr: string): string {
+  const output = `${stdout}\n${stderr}`.toLowerCase();
+  if (output.includes("no module named") && output.includes("acp")) {
+    return (
+      "Hermes is installed without ACP support. Install the ACP extra " +
+      "(`cd ~/.hermes/hermes-agent && uv pip install -e '.[acp]'`)."
+    );
+  }
+  return "Hermes ACP health check failed. Run `hermes acp --check` for details.";
+}
+
 export const checkHermesProviderStatus = Effect.fn("checkHermesProviderStatus")(function* (
   hermesSettings: HermesSettings,
   environment: NodeJS.ProcessEnv = process.env,
-): Effect.fn.Return<
-  ServerProviderDraft,
-  never,
-  ChildProcessSpawner.ChildProcessSpawner | Crypto.Crypto
-> {
+): Effect.fn.Return<ServerProviderDraft, never, ChildProcessSpawner.ChildProcessSpawner> {
   const checkedAt = DateTime.formatIso(yield* DateTime.now);
   const fallbackModels = hermesModelsFromSettings(hermesSettings.customModels);
 
@@ -288,13 +229,13 @@ export const checkHermesProviderStatus = Effect.fn("checkHermesProviderStatus")(
     });
   }
 
-  const discoveryExit = yield* discoverHermesViaAcp(hermesSettings, environment).pipe(
-    Effect.timeoutOption(HERMES_ACP_DISCOVERY_TIMEOUT_MS),
-    Effect.exit,
+  const acpCheckResult = yield* runHermesAcpCheckCommand(hermesSettings, environment).pipe(
+    Effect.timeoutOption(HERMES_ACP_CHECK_TIMEOUT_MS),
+    Effect.result,
   );
-  if (Exit.isFailure(discoveryExit)) {
-    yield* Effect.logWarning("Hermes ACP discovery failed", {
-      errorTag: causeErrorTag(discoveryExit.cause),
+  if (Result.isFailure(acpCheckResult)) {
+    yield* Effect.logWarning("Hermes ACP health check failed", {
+      errorTag: acpCheckResult.failure._tag,
     });
     return buildServerProvider({
       presentation: HERMES_PRESENTATION,
@@ -306,15 +247,13 @@ export const checkHermesProviderStatus = Effect.fn("checkHermesProviderStatus")(
         version,
         status: "error",
         auth: { status: "unknown" },
-        message:
-          "Hermes is installed but `hermes acp` failed to start. Install the ACP extra " +
-          "(`cd ~/.hermes/hermes-agent && uv pip install -e '.[acp]'`) and check server logs.",
+        message: "Failed to execute `hermes acp --check`.",
       },
     });
   }
-  if (Option.isNone(discoveryExit.value)) {
+  if (Option.isNone(acpCheckResult.success)) {
     yield* Effect.logWarning(
-      `Hermes ACP discovery timed out after ${HERMES_ACP_DISCOVERY_TIMEOUT_MS}ms.`,
+      `Hermes ACP health check timed out after ${HERMES_ACP_CHECK_TIMEOUT_MS}ms.`,
     );
     return buildServerProvider({
       presentation: HERMES_PRESENTATION,
@@ -326,30 +265,29 @@ export const checkHermesProviderStatus = Effect.fn("checkHermesProviderStatus")(
         version,
         status: "error",
         auth: { status: "unknown" },
-        message: `Hermes ACP startup timed out after ${HERMES_ACP_DISCOVERY_TIMEOUT_MS}ms.`,
+        message: `Hermes ACP health check timed out after ${HERMES_ACP_CHECK_TIMEOUT_MS}ms.`,
       },
     });
   }
 
-  const discovery = discoveryExit.value.value;
-  const models =
-    discovery.models.length > 0
-      ? hermesModelsFromSettings(hermesSettings.customModels, discovery.models)
-      : fallbackModels;
-
-  if (discovery.auth.status === "unauthenticated") {
+  const acpCheckOutput = acpCheckResult.success.value;
+  if (acpCheckOutput.code !== 0) {
+    yield* Effect.logWarning("Hermes ACP health check exited with a non-zero status.", {
+      exitCode: acpCheckOutput.code,
+      stdoutLength: acpCheckOutput.stdout.length,
+      stderrLength: acpCheckOutput.stderr.length,
+    });
     return buildServerProvider({
       presentation: HERMES_PRESENTATION,
       enabled: hermesSettings.enabled,
       checkedAt,
-      models,
+      models: fallbackModels,
       probe: {
         installed: true,
         version,
         status: "error",
-        auth: discovery.auth,
-        message:
-          "Hermes has no model provider configured. Run `hermes setup` (or `hermes model`) and try again.",
+        auth: { status: "unknown" },
+        message: hermesAcpCheckFailureMessage(acpCheckOutput.stdout, acpCheckOutput.stderr),
       },
     });
   }
@@ -358,12 +296,12 @@ export const checkHermesProviderStatus = Effect.fn("checkHermesProviderStatus")(
     presentation: HERMES_PRESENTATION,
     enabled: hermesSettings.enabled,
     checkedAt,
-    models,
+    models: fallbackModels,
     probe: {
       installed: true,
       version,
       status: "ready",
-      auth: discovery.auth,
+      auth: { status: "unknown" },
     },
   });
 });

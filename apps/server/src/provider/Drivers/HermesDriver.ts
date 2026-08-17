@@ -1,18 +1,3 @@
-/**
- * HermesDriver — `ProviderDriver` for Nous Research's Hermes Agent
- * (`hermes`) runtime.
- *
- * Hermes exposes a spec-conformant ACP stdio server via `hermes acp`. The
- * driver reuses the shared ACP session runtime; auth status and the model
- * catalog both ride on the ACP handshake (`initialize.authMethods` +
- * `session/new.models`), so the snapshot probe spawns one short-lived ACP
- * child instead of shelling out to separate status commands.
- *
- * Text generation drives `runtime.prompt` with a structured-output schema
- * through `makeHermesTextGeneration`, mirroring the Grok driver.
- *
- * @module provider/Drivers/HermesDriver
- */
 import { HermesSettings, ProviderDriverKind, type ServerProvider } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";

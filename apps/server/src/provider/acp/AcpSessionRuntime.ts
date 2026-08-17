@@ -68,15 +68,7 @@ export interface AcpSessionRuntimeOptions {
     readonly name: string;
     readonly version: string;
   };
-  /**
-   * Auth method used for the `authenticate` handshake. Either a static
-   * method id known before the connection opens (Cursor's `cursor_login`,
-   * Grok's environment-derived ids), or a resolver over the agent's
-   * `initialize` response for agents that advertise their method
-   * dynamically (Hermes lists the configured model provider). A resolver
-   * returning `undefined` skips the `authenticate` call entirely — the
-   * agent requires no client-driven auth for the session that follows.
-   */
+  /** A resolver may select dynamic auth from initialize; undefined skips authentication. */
   readonly authMethodId:
     | string
     | ((initializeResult: EffectAcpSchema.InitializeResponse) => string | undefined);

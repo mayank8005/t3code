@@ -153,10 +153,7 @@ export const DEFAULT_MODEL_BY_PROVIDER: Partial<Record<ProviderDriverKind, strin
   [CLAUDE_DRIVER_KIND]: "claude-sonnet-5",
   [CURSOR_DRIVER_KIND]: "auto",
   [GROK_DRIVER_KIND]: "grok-build",
-  // Hermes model ids are `provider:model` pairs discovered from the user's
-  // own Hermes configuration, so there is no universally-valid slug to pin
-  // here. "default" is a sentinel the Hermes adapter maps to "keep the
-  // session's currently-configured model".
+  // Hermes owns its default model selection.
   [HERMES_DRIVER_KIND]: "default",
   [OPENCODE_DRIVER_KIND]: "openai/gpt-5",
 };

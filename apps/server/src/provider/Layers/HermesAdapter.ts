@@ -1,15 +1,3 @@
-/**
- * HermesAdapterLive — Hermes Agent CLI (`hermes acp`) via ACP.
- *
- * Hermes speaks spec-conformant ACP: sessions advertise a
- * `SessionModelState` (switched via `session/set_model`) and permission
- * prompts arrive through the standard `session/request_permission` request.
- * There are no vendor extension methods to bridge, and Hermes' edit-approval
- * modes are left on their `default` (ask before edits) setting — T3 Code's
- * full-access mode auto-approves the resulting permission prompts instead.
- *
- * @module HermesAdapterLive
- */
 import {
   ApprovalRequestId,
   type HermesSettings,
@@ -32,6 +20,7 @@ import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Predicate from "effect/Predicate";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
@@ -53,7 +42,6 @@ import {
   ProviderAdapterValidationError,
 } from "../Errors.ts";
 import { mapAcpToAdapterError } from "../acp/AcpAdapterSupport.ts";
-import type * as AcpSessionRuntime from "../acp/AcpSessionRuntime.ts";
 import {
   makeAcpAssistantItemEvent,
   makeAcpContentDeltaEvent,
@@ -69,6 +57,7 @@ import {
   currentHermesModelIdFromSessionSetup,
   makeHermesAcpRuntime,
   resolveHermesAcpModelId,
+  type HermesAcpRuntime,
 } from "../acp/HermesAcpSupport.ts";
 import { type HermesAdapterShape } from "../Services/HermesAdapter.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
@@ -99,17 +88,13 @@ interface HermesSessionContext {
   readonly acpSessionId: string;
   session: ProviderSession;
   readonly scope: Scope.Closeable;
-  readonly acp: AcpSessionRuntime.AcpSessionRuntime["Service"];
+  readonly acp: HermesAcpRuntime;
   notificationFiber: Fiber.Fiber<void, never> | undefined;
   readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
   turns: Array<{ id: TurnId; items: Array<unknown> }>;
   lastPlanFingerprint: string | undefined;
   activeTurnId: TurnId | undefined;
-  /** Turns already interrupted; late prompt RPCs must not resurrect them. */
   interruptedTurnIds: Set<TurnId>;
-  /** Number of sendTurn prompts currently in flight or being prepared.
-   * >0 means a turn is actively running, so a new sendTurn is a steer that
-   * continues it, and only the last remaining prompt settles the turn. */
   promptsInFlight: number;
   currentModelId: string | undefined;
   stopped: boolean;
@@ -141,10 +126,6 @@ function appendPromptResultToTurn(
     : [...ctx.turns, { id: turnId, items: [{ prompt: promptParts, result }] }];
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 const resolveNotificationTurnId = (ctx: HermesSessionContext): TurnId | undefined =>
   ctx.activeTurnId;
 
@@ -154,7 +135,7 @@ const resolveSessionCallbackTurnId = (
 ): TurnId | undefined => sessions.get(threadId)?.activeTurnId;
 
 function parseHermesResume(raw: unknown): { sessionId: string } | undefined {
-  if (!isRecord(raw)) return undefined;
+  if (!Predicate.isObject(raw)) return undefined;
   if (raw.schemaVersion !== HERMES_RESUME_VERSION) return undefined;
   if (typeof raw.sessionId !== "string" || !raw.sessionId.trim()) return undefined;
   return { sessionId: raw.sessionId.trim() };
@@ -164,20 +145,20 @@ function selectPermissionOptionId(
   request: EffectAcpSchema.RequestPermissionRequest,
   decision: Exclude<ProviderApprovalDecision, "cancel">,
 ): string | undefined {
-  const kind =
+  const optionId =
     decision === "acceptForSession"
-      ? "allow_always"
+      ? "allow_session"
       : decision === "accept"
         ? "allow_once"
-        : "reject_once";
-  const option = request.options.find((entry) => entry.kind === kind);
-  return option?.optionId.trim() || undefined;
+        : "deny";
+  return request.options.find((entry) => entry.optionId.trim() === optionId)?.optionId;
 }
 
 function selectAutoApprovedPermissionOption(
   request: EffectAcpSchema.RequestPermissionRequest,
 ): string | undefined {
   return (
+    request.options.find((entry) => entry.optionId.trim() === "allow_always")?.optionId ??
     selectPermissionOptionId(request, "acceptForSession") ??
     selectPermissionOptionId(request, "accept")
   );
@@ -277,7 +258,6 @@ export function makeHermesAdapter(
         readonly errorMessage?: string;
         readonly completedStopReason?: EffectAcpSchema.StopReason | null;
         readonly emitTurnCompletion?: boolean;
-        /** Interrupt/cancel: drop every outstanding prompt slot and settle once. */
         readonly settleAllPrompts?: boolean;
       },
     ) =>
@@ -294,9 +274,7 @@ export function makeHermesAdapter(
           turnId,
         });
         if (!settlementBelongsToLiveContext) {
-          // interruptTurn already consumed every prompt slot for this turn. A
-          // late prompt result must neither emit a second terminal event nor
-          // consume a slot belonging to a newer turn on the same ACP session.
+          // Ignore late results after cancellation or session replacement.
           if (
             liveCtx.acpSessionId !== expectedAcpSessionId ||
             liveCtx.interruptedTurnIds.has(turnId)
@@ -792,11 +770,7 @@ export function makeHermesAdapter(
             Effect.catch((cause) =>
               Effect.logError("Failed to process Hermes runtime notification.", { cause }),
             ),
-            // Fork into the session scope, not the calling fiber. `forkChild`
-            // makes this a child of `startSession`, and Effect interrupts a
-            // fiber's children when it completes, so the consumer would die as
-            // soon as `startSession` returned and every later notification
-            // would be dropped.
+            // The consumer must outlive the startSession request fiber.
             Effect.forkIn(ctx.scope),
           );
 
@@ -836,21 +810,31 @@ export function makeHermesAdapter(
           input.threadId,
           Effect.gen(function* () {
             const ctx = yield* requireSession(input.threadId);
-            // A sendTurn while a prompt is in flight is a steer: the agent
-            // folds the new prompt into the ongoing work, so the active turn
-            // id is reused instead of opening a new turn.
             const steeringTurnId = ctx.promptsInFlight > 0 ? ctx.activeTurnId : undefined;
-            const turnId = steeringTurnId ?? TurnId.make(yield* randomUUIDv4);
-            // Count this prompt immediately so a superseded in-flight prompt
-            // resolving from here on does not settle the turn; decremented on
-            // preparation failure here, and after the prompt below otherwise.
+            if (steeringTurnId !== undefined) {
+              const text = input.input?.trim();
+              if (!text || (input.attachments?.length ?? 0) > 0) {
+                return yield* new ProviderAdapterValidationError({
+                  provider: PROVIDER,
+                  operation: "sendTurn",
+                  issue: "Hermes steering requires non-empty text without attachments.",
+                });
+              }
+              return {
+                _tag: "Steer" as const,
+                acp: ctx.acp,
+                turnId: steeringTurnId,
+                text,
+                resumeCursor: ctx.session.resumeCursor,
+              };
+            }
+
+            const turnId = TurnId.make(yield* randomUUIDv4);
             ctx.promptsInFlight += 1;
-            // Bind the turn id before cooperative yields so interruptTurn can
-            // settle this prompt even if stop arrives during preparation.
             ctx.activeTurnId = turnId;
             ctx.session = {
               ...ctx.session,
-              status: steeringTurnId === undefined ? "connecting" : "running",
+              status: "connecting",
               activeTurnId: turnId,
               updatedAt: yield* nowIso,
             };
@@ -933,9 +917,7 @@ export function makeHermesAdapter(
                   detail: "Hermes prompt was interrupted during preparation.",
                 });
               }
-              if (steeringTurnId === undefined) {
-                ctx.lastPlanFingerprint = undefined;
-              }
+              ctx.lastPlanFingerprint = undefined;
               ctx.session = {
                 ...ctx.session,
                 status: "running",
@@ -944,18 +926,17 @@ export function makeHermesAdapter(
                 ...(displayModel ? { model: displayModel } : {}),
               };
 
-              if (steeringTurnId === undefined) {
-                yield* offerRuntimeEvent({
-                  type: "turn.started",
-                  ...(yield* makeEventStamp()),
-                  provider: PROVIDER,
-                  threadId: input.threadId,
-                  turnId,
-                  payload: displayModel ? { model: displayModel } : {},
-                });
-              }
+              yield* offerRuntimeEvent({
+                type: "turn.started",
+                ...(yield* makeEventStamp()),
+                provider: PROVIDER,
+                threadId: input.threadId,
+                turnId,
+                payload: displayModel ? { model: displayModel } : {},
+              });
 
               return {
+                _tag: "Prompt" as const,
                 acp: ctx.acp,
                 acpSessionId: ctx.acpSessionId,
                 displayModel,
@@ -978,6 +959,21 @@ export function makeHermesAdapter(
             );
           }),
         );
+        if (prepared._tag === "Steer") {
+          yield* prepared.acp
+            .steer(prepared.text)
+            .pipe(
+              Effect.mapError((error) =>
+                mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
+              ),
+            );
+          return {
+            threadId: input.threadId,
+            turnId: prepared.turnId,
+            resumeCursor: prepared.resumeCursor,
+          };
+        }
+
         const promptSettled = yield* Ref.make(false);
         const promptRpcSucceeded = yield* Ref.make(false);
         const promptResultRef = yield* Ref.make<EffectAcpSchema.PromptResponse | undefined>(
@@ -1030,9 +1026,6 @@ export function makeHermesAdapter(
                   detail: "Hermes session changed before the turn completed.",
                 });
               }
-              // Keep prompt settlement atomic with respect to Stop and steering.
-              // interruptTurn marks its target before waiting for this lock, so
-              // cancellation can still win while queued ACP events are drained.
               for (let yieldAttempt = 0; yieldAttempt < 8; yieldAttempt += 1) {
                 yield* Effect.yieldNow;
               }
@@ -1070,9 +1063,6 @@ export function makeHermesAdapter(
               const remainingPrompts = Math.max(0, ctx.promptsInFlight - 1);
               ctx.promptsInFlight = remainingPrompts;
 
-              // Only the last remaining prompt settles the turn. A steer-
-              // superseded prompt resolving while another is in flight or
-              // pending must leave the merged turn running.
               if (
                 remainingPrompts === 0 &&
                 ctx.activeTurnId === prepared.turnId &&
@@ -1291,9 +1281,6 @@ export function makeHermesAdapter(
     const respondToUserInput: HermesAdapterShape["respondToUserInput"] = (threadId, requestId) =>
       Effect.gen(function* () {
         yield* requireSession(threadId);
-        // Hermes has no user-input extension (there is no ACP-standard
-        // counterpart to Cursor's `cursor/ask_question`), so no request can
-        // be pending.
         return yield* new ProviderAdapterRequestError({
           provider: PROVIDER,
           method: "user-input/respond",

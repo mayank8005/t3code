@@ -9,12 +9,7 @@ import type * as EffectAcpSchema from "effect-acp/schema";
 
 import * as AcpSessionRuntime from "./AcpSessionRuntime.ts";
 
-/**
- * Hermes always advertises this terminal-type auth method so ACP registries
- * see at least one usable method on a fresh install. It launches Hermes'
- * interactive setup out-of-band and is never selectable from T3 Code, so
- * the auth resolver skips it when picking the `authenticate` method.
- */
+/** Terminal-only setup is not a client authentication method. */
 export const HERMES_SETUP_AUTH_METHOD_ID = "hermes-setup";
 
 type HermesAcpRuntimeHermesSettings = Pick<HermesSettings, "binaryPath">;
@@ -27,6 +22,10 @@ interface HermesAcpRuntimeInput extends Omit<
   readonly hermesSettings: HermesAcpRuntimeHermesSettings | null | undefined;
   readonly environment?: NodeJS.ProcessEnv;
 }
+
+export type HermesAcpRuntime = AcpSessionRuntime.AcpSessionRuntime["Service"] & {
+  readonly steer: (text: string) => Effect.Effect<void, EffectAcpErrors.AcpError>;
+};
 
 export function buildHermesAcpSpawnInput(
   hermesSettings: HermesAcpRuntimeHermesSettings | null | undefined,
@@ -41,16 +40,6 @@ export function buildHermesAcpSpawnInput(
   };
 }
 
-/**
- * Pick the agent-managed auth method from a Hermes `initialize` response.
- *
- * Hermes advertises the currently-configured model provider (e.g.
- * `openrouter`, `nous`) as an agent-managed method when runtime credentials
- * exist, plus the always-present `hermes-setup` terminal method. Returns
- * the provider method id, or `undefined` when only the setup method is
- * advertised — in which case `authenticate` is skipped and the session
- * proceeds unauthenticated (Hermes does not gate `session/new` on auth).
- */
 export function resolveHermesAcpAuthMethodId(
   initializeResult: EffectAcpSchema.InitializeResponse,
 ): string | undefined {
@@ -65,11 +54,7 @@ export function resolveHermesAcpAuthMethodId(
 
 export const makeHermesAcpRuntime = (
   input: HermesAcpRuntimeInput,
-): Effect.Effect<
-  AcpSessionRuntime.AcpSessionRuntime["Service"],
-  EffectAcpErrors.AcpError,
-  Crypto.Crypto | Scope.Scope
-> =>
+): Effect.Effect<HermesAcpRuntime, EffectAcpErrors.AcpError, Crypto.Crypto | Scope.Scope> =>
   Effect.gen(function* () {
     const acpContext = yield* Layer.build(
       AcpSessionRuntime.layer({
@@ -82,19 +67,23 @@ export const makeHermesAcpRuntime = (
         ),
       ),
     );
-    return yield* Effect.service(AcpSessionRuntime.AcpSessionRuntime).pipe(
+    const runtime = yield* Effect.service(AcpSessionRuntime.AcpSessionRuntime).pipe(
       Effect.provide(acpContext),
     );
+    return {
+      ...runtime,
+      steer: (text) =>
+        Effect.gen(function* () {
+          const started = yield* runtime.start();
+          yield* runtime.request("session/prompt", {
+            sessionId: started.sessionId,
+            prompt: [{ type: "text", text: `/steer ${text}` }],
+          } satisfies EffectAcpSchema.PromptRequest);
+        }),
+    };
   });
 
-/**
- * Normalize a T3 Code model selection into a Hermes ACP model id.
- *
- * Hermes model ids are `provider:model` pairs discovered from the user's
- * own configuration; there is no universal default slug. The `default` /
- * `auto` sentinels (and empty selections) mean "keep the model the session
- * is already configured with", signalled by returning `undefined`.
- */
+/** The default and auto sentinels keep Hermes' session-selected model. */
 export function resolveHermesAcpModelId(model: string | null | undefined): string | undefined {
   const trimmed = model?.trim();
   if (!trimmed) {

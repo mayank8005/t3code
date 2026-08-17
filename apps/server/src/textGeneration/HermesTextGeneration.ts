@@ -1,16 +1,14 @@
-import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
-import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
-import { ChildProcessSpawner } from "effect/unstable/process";
-import type * as EffectAcpErrors from "effect-acp/errors";
+import * as Stream from "effect/Stream";
+import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
-import { type HermesSettings, type ModelSelection } from "@t3tools/contracts";
+import { type HermesSettings, type ModelSelection, TextGenerationError } from "@t3tools/contracts";
 import { sanitizeBranchFragment, sanitizeFeatureBranchName } from "@t3tools/shared/git";
 import { extractJsonObject } from "@t3tools/shared/schemaJson";
+import { resolveSpawnCommand } from "@t3tools/shared/shell";
 
-import { TextGenerationError } from "@t3tools/contracts";
 import * as TextGeneration from "./TextGeneration.ts";
 import {
   buildBranchNamePrompt,
@@ -19,143 +17,153 @@ import {
   buildThreadTitlePrompt,
 } from "./TextGenerationPrompts.ts";
 import {
+  normalizeCliError,
   sanitizeCommitSubject,
   sanitizePrTitle,
   sanitizeThreadTitle,
 } from "./TextGenerationUtils.ts";
-import {
-  applyHermesAcpModelSelection,
-  currentHermesModelIdFromSessionSetup,
-  makeHermesAcpRuntime,
-  resolveHermesAcpModelId,
-} from "../provider/acp/HermesAcpSupport.ts";
 
 const HERMES_TIMEOUT_MS = 180_000;
+const NO_TOOLS_TOOLSET = "t3-text-generation-no-tools";
 
-const isTextGenerationError = Schema.is(TextGenerationError);
+type TextGenerationOperation =
+  | "generateCommitMessage"
+  | "generatePrContent"
+  | "generateBranchName"
+  | "generateThreadTitle";
+
+function resolveHermesModelArgs(model: string): ReadonlyArray<string> {
+  const trimmed = model.trim();
+  const normalized = trimmed.toLowerCase();
+  if (!trimmed || normalized === "default" || normalized === "auto") {
+    return [];
+  }
+  const separatorIndex = trimmed.indexOf(":");
+  if (separatorIndex <= 0 || separatorIndex === trimmed.length - 1) {
+    return ["--model", trimmed];
+  }
+  return [
+    "--provider",
+    trimmed.slice(0, separatorIndex),
+    "--model",
+    trimmed.slice(separatorIndex + 1),
+  ];
+}
 
 export const makeHermesTextGeneration = Effect.fn("makeHermesTextGeneration")(function* (
   hermesSettings: HermesSettings,
   environment: NodeJS.ProcessEnv = process.env,
 ) {
-  const crypto = yield* Crypto.Crypto;
   const commandSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
 
-  const runHermesJson = <S extends Schema.Top>({
-    operation,
-    cwd,
-    prompt,
-    outputSchemaJson,
-    modelSelection,
-  }: {
-    operation:
-      | "generateCommitMessage"
-      | "generatePrContent"
-      | "generateBranchName"
-      | "generateThreadTitle";
-    cwd: string;
-    prompt: string;
-    outputSchemaJson: S;
-    modelSelection: ModelSelection;
+  const readStreamAsString = <E>(
+    operation: TextGenerationOperation,
+    stream: Stream.Stream<Uint8Array, E>,
+  ): Effect.Effect<string, TextGenerationError> =>
+    stream.pipe(
+      Stream.decodeText(),
+      Stream.runFold(
+        () => "",
+        (output, chunk) => output + chunk,
+      ),
+      Effect.mapError((cause) =>
+        normalizeCliError("hermes", operation, cause, "Failed to collect process output"),
+      ),
+    );
+
+  const runHermesJson = <S extends Schema.Top>(input: {
+    readonly operation: TextGenerationOperation;
+    readonly cwd: string;
+    readonly prompt: string;
+    readonly outputSchemaJson: S;
+    readonly modelSelection: ModelSelection;
   }): Effect.Effect<S["Type"], TextGenerationError, S["DecodingServices"]> =>
     Effect.gen(function* () {
-      const requestedModelId = resolveHermesAcpModelId(modelSelection.model);
-      const outputRef = yield* Ref.make("");
-      const runtime = yield* makeHermesAcpRuntime({
-        hermesSettings,
-        environment,
-        childProcessSpawner: commandSpawner,
-        cwd,
-        clientInfo: { name: "t3-code-git-text", version: "0.0.0" },
-      }).pipe(Effect.provideService(Crypto.Crypto, crypto));
-
-      yield* runtime.handleSessionUpdate((notification) => {
-        const update = notification.update;
-        if (update.sessionUpdate !== "agent_message_chunk") {
-          return Effect.void;
-        }
-        const content = update.content;
-        if (content.type !== "text") {
-          return Effect.void;
-        }
-        return Ref.update(outputRef, (current) => current + content.text);
-      });
-
-      const promptResult = yield* Effect.gen(function* () {
-        const started = yield* runtime.start();
-        yield* applyHermesAcpModelSelection({
-          runtime,
-          currentModelId: currentHermesModelIdFromSessionSetup(started.sessionSetupResult),
-          requestedModelId,
-          mapError: (cause) =>
-            new TextGenerationError({
-              operation,
-              detail: "Failed to set Hermes ACP model for text generation.",
-              cause,
-            }),
-        });
-
-        return yield* runtime.prompt({
-          prompt: [{ type: "text", text: prompt }],
-        });
-      }).pipe(
-        Effect.timeoutOption(HERMES_TIMEOUT_MS),
-        Effect.flatMap(
-          Option.match({
-            onNone: () =>
-              Effect.fail(
-                new TextGenerationError({ operation, detail: "Hermes ACP request timed out." }),
-              ),
-            onSome: (value) => Effect.succeed(value),
+      const command = hermesSettings.binaryPath || "hermes";
+      const args = [
+        "--toolsets",
+        NO_TOOLS_TOOLSET,
+        "--ignore-rules",
+        ...resolveHermesModelArgs(input.modelSelection.model),
+        "--oneshot",
+        input.prompt,
+      ];
+      const spawnCommand = yield* resolveSpawnCommand(command, args, { env: environment });
+      const child = yield* commandSpawner
+        .spawn(
+          ChildProcess.make(spawnCommand.command, spawnCommand.args, {
+            cwd: input.cwd,
+            env: environment,
+            shell: spawnCommand.shell,
           }),
-        ),
-        Effect.mapError((cause: EffectAcpErrors.AcpError | TextGenerationError) =>
-          isTextGenerationError(cause)
-            ? cause
-            : new TextGenerationError({
-                operation,
-                detail: "Hermes ACP request failed.",
-                cause,
-              }),
-        ),
-      );
+        )
+        .pipe(
+          Effect.mapError((cause) =>
+            normalizeCliError(
+              "hermes",
+              input.operation,
+              cause,
+              "Failed to spawn Hermes CLI process",
+            ),
+          ),
+        );
 
-      const trimmed = (yield* Ref.get(outputRef)).trim();
-      if (!trimmed) {
+      const result = yield* Effect.all(
+        [
+          readStreamAsString(input.operation, child.stdout),
+          readStreamAsString(input.operation, child.stderr),
+          child.exitCode.pipe(
+            Effect.mapError((cause) =>
+              normalizeCliError(
+                "hermes",
+                input.operation,
+                cause,
+                "Failed to read Hermes CLI exit code",
+              ),
+            ),
+          ),
+        ],
+        { concurrency: "unbounded" },
+      ).pipe(Effect.timeoutOption(HERMES_TIMEOUT_MS));
+
+      if (Option.isNone(result)) {
         return yield* new TextGenerationError({
-          operation,
-          detail:
-            promptResult.stopReason === "cancelled"
-              ? "Hermes ACP request was cancelled."
-              : "Hermes Agent returned empty output.",
+          operation: input.operation,
+          detail: "Hermes CLI request timed out.",
         });
       }
 
-      const decodeOutput = Schema.decodeEffect(Schema.fromJsonString(outputSchemaJson));
-      return yield* decodeOutput(extractJsonObject(trimmed)).pipe(
-        Effect.catchTags({
-          SchemaError: (cause) =>
-            Effect.fail(
-              new TextGenerationError({
-                operation,
-                detail: "Hermes Agent returned invalid structured output.",
-                cause,
-              }),
-            ),
-        }),
-      );
-    }).pipe(
-      Effect.mapError((cause) =>
-        isTextGenerationError(cause)
-          ? cause
-          : new TextGenerationError({
-              operation,
-              detail: "Hermes ACP text generation failed.",
+      const [stdout, stderr, exitCode] = result.value;
+      if (exitCode !== 0) {
+        const detail = stderr.trim() || stdout.trim();
+        return yield* new TextGenerationError({
+          operation: input.operation,
+          detail: detail
+            ? `Hermes CLI command failed: ${detail}`
+            : `Hermes CLI command failed with code ${exitCode}.`,
+        });
+      }
+
+      const output = stdout.trim();
+      if (!output) {
+        return yield* new TextGenerationError({
+          operation: input.operation,
+          detail: "Hermes Agent returned empty output.",
+        });
+      }
+
+      const decodeOutput = Schema.decodeEffect(Schema.fromJsonString(input.outputSchemaJson));
+      return yield* decodeOutput(extractJsonObject(output)).pipe(
+        Effect.mapError(
+          (cause) =>
+            new TextGenerationError({
+              operation: input.operation,
+              detail: "Hermes Agent returned invalid structured output.",
               cause,
             }),
-      ),
-      Effect.scoped,
-    );
+        ),
+      );
+    }).pipe(Effect.scoped);
 
   const generateCommitMessage: TextGeneration.TextGeneration["Service"]["generateCommitMessage"] =
     Effect.fn("HermesTextGeneration.generateCommitMessage")(function* (input) {
@@ -166,7 +174,6 @@ export const makeHermesTextGeneration = Effect.fn("makeHermesTextGeneration")(fu
         includeBranch: input.includeBranch === true,
         policy: input.policy,
       });
-
       const generated = yield* runHermesJson({
         operation: "generateCommitMessage",
         cwd: input.cwd,
@@ -174,7 +181,6 @@ export const makeHermesTextGeneration = Effect.fn("makeHermesTextGeneration")(fu
         outputSchemaJson: outputSchema,
         modelSelection: input.modelSelection,
       });
-
       return {
         subject: sanitizeCommitSubject(generated.subject),
         body: generated.body.trim(),
@@ -195,7 +201,6 @@ export const makeHermesTextGeneration = Effect.fn("makeHermesTextGeneration")(fu
         policy: input.policy,
         changeRequestTemplate: input.changeRequestTemplate,
       });
-
       const generated = yield* runHermesJson({
         operation: "generatePrContent",
         cwd: input.cwd,
@@ -203,11 +208,7 @@ export const makeHermesTextGeneration = Effect.fn("makeHermesTextGeneration")(fu
         outputSchemaJson: outputSchema,
         modelSelection: input.modelSelection,
       });
-
-      return {
-        title: sanitizePrTitle(generated.title),
-        body: generated.body.trim(),
-      };
+      return { title: sanitizePrTitle(generated.title), body: generated.body.trim() };
     });
 
   const generateBranchName: TextGeneration.TextGeneration["Service"]["generateBranchName"] =
@@ -216,7 +217,6 @@ export const makeHermesTextGeneration = Effect.fn("makeHermesTextGeneration")(fu
         message: input.message,
         attachments: input.attachments,
       });
-
       const generated = yield* runHermesJson({
         operation: "generateBranchName",
         cwd: input.cwd,
@@ -224,10 +224,7 @@ export const makeHermesTextGeneration = Effect.fn("makeHermesTextGeneration")(fu
         outputSchemaJson: outputSchema,
         modelSelection: input.modelSelection,
       });
-
-      return {
-        branch: sanitizeBranchFragment(generated.branch),
-      };
+      return { branch: sanitizeBranchFragment(generated.branch) };
     });
 
   const generateThreadTitle: TextGeneration.TextGeneration["Service"]["generateThreadTitle"] =
@@ -237,7 +234,6 @@ export const makeHermesTextGeneration = Effect.fn("makeHermesTextGeneration")(fu
         previousTitle: input.previousTitle,
         attachments: input.attachments,
       });
-
       const generated = yield* runHermesJson({
         operation: "generateThreadTitle",
         cwd: input.cwd,
@@ -245,10 +241,7 @@ export const makeHermesTextGeneration = Effect.fn("makeHermesTextGeneration")(fu
         outputSchemaJson: outputSchema,
         modelSelection: input.modelSelection,
       });
-
-      return {
-        title: sanitizeThreadTitle(generated.title),
-      } satisfies TextGeneration.ThreadTitleGenerationResult;
+      return { title: sanitizeThreadTitle(generated.title) };
     });
 
   return {

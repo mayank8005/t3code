@@ -221,8 +221,6 @@ export const HermesIcon: Icon = ({ className, ...props }) => (
     strokeLinecap="round"
     strokeLinejoin="round"
   >
-    {/* Winged-staff mark: the caduceus Hermes carries, reduced to a staff
-        and one wing sweep per side so it stays legible at 16px. */}
     <path d="M12 3.5v17" />
     <path d="M12 6.5C10.5 4.5 7.5 4 5 5.5c2 .5 3.5 1.5 4.5 3" />
     <path d="M12 6.5c1.5-2 4.5-2.5 7-1-2 .5-3.5 1.5-4.5 3" />

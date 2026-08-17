@@ -1,35 +1,21 @@
 // @effect-diagnostics nodeBuiltinImport:off
-import * as NodePath from "node:path";
-import * as NodeOS from "node:os";
-import * as NodeURL from "node:url";
 import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { it } from "@effect/vitest";
+import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
-import { createModelSelection } from "@t3tools/shared/model";
-import { expect } from "vite-plus/test";
 import { HermesSettings, ProviderInstanceId } from "@t3tools/contracts";
+import { createModelSelection } from "@t3tools/shared/model";
 
 import * as ServerConfig from "../config.ts";
 import * as TextGeneration from "./TextGeneration.ts";
 import { makeHermesTextGeneration } from "./HermesTextGeneration.ts";
+
 const decodeHermesSettings = Schema.decodeSync(HermesSettings);
-
-const __dirname = NodePath.dirname(NodeURL.fileURLToPath(import.meta.url));
-const mockAgentPath = NodePath.join(__dirname, "../../scripts/acp-mock-agent.ts");
-
-const HERMES_SESSION_MODELS_JSON = JSON.stringify([
-  { modelId: "openrouter:qwen/qwen3-coder", name: "Qwen3 Coder" },
-  { modelId: "openrouter:moonshotai/kimi-k2", name: "Kimi K2" },
-  { modelId: "nous:Hermes-4-405B", name: "Hermes 4 405B" },
-]);
-const HERMES_AUTH_METHODS_JSON = JSON.stringify([
-  { id: "openrouter", name: "openrouter runtime credentials" },
-  { type: "terminal", id: "hermes-setup", name: "Configure Hermes provider", args: ["--setup"] },
-]);
 const ALT_MODEL_ID = "openrouter:moonshotai/kimi-k2";
 
 function shellSingleQuote(value: string): string {
@@ -40,7 +26,10 @@ const HermesTextGenerationTestLayer = ServerConfig.ServerConfig.layerTest(proces
   prefix: "t3code-hermes-text-generation-test-",
 }).pipe(Layer.provideMerge(NodeServices.layer));
 
-function makeAcpHermesWrapper(dir: string, env: Record<string, string>): string {
+function makeHermesWrapper(
+  dir: string,
+  input: { readonly output: string; readonly exitCode?: number; readonly argsPath?: string },
+): string {
   const binDir = NodePath.join(dir, "bin");
   const hermesPath = NodePath.join(binDir, "hermes");
   NodeFS.mkdirSync(binDir, { recursive: true });
@@ -48,14 +37,9 @@ function makeAcpHermesWrapper(dir: string, env: Record<string, string>): string 
     hermesPath,
     [
       "#!/bin/sh",
-      `export T3_ACP_SESSION_MODELS=${shellSingleQuote(HERMES_SESSION_MODELS_JSON)}`,
-      `export T3_ACP_AUTH_METHODS=${shellSingleQuote(HERMES_AUTH_METHODS_JSON)}`,
-      ...Object.entries(env).map(([key, value]) => `export ${key}=${shellSingleQuote(value)}`),
-      'if [ "$1" != "acp" ]; then',
-      '  printf "%s\\n" "unexpected args: $*" >&2',
-      "  exit 11",
-      "fi",
-      `exec ${JSON.stringify(process.execPath)} ${JSON.stringify(mockAgentPath)}`,
+      ...(input.argsPath ? [`printf "%s\\0" "$@" > ${shellSingleQuote(input.argsPath)}`] : []),
+      `printf "%s" ${shellSingleQuote(input.output)}`,
+      `exit ${input.exitCode ?? 0}`,
       "",
     ].join("\n"),
     "utf8",
@@ -64,47 +48,36 @@ function makeAcpHermesWrapper(dir: string, env: Record<string, string>): string 
   return hermesPath;
 }
 
-function withFakeAcpHermes<A, E, R>(
-  env: Record<string, string>,
+function withFakeHermes<A, E, R>(
+  input: { readonly output: string; readonly exitCode?: number; readonly argsPath?: string },
   effectFn: (textGeneration: TextGeneration.TextGeneration["Service"]) => Effect.Effect<A, E, R>,
 ) {
   return Effect.gen(function* () {
-    const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3code-hermes-text-acp-"));
+    const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3code-hermes-text-"));
     yield* Effect.addFinalizer(() =>
-      Effect.sync(() => {
-        NodeFS.rmSync(tempDir, { recursive: true, force: true });
-      }),
+      Effect.sync(() => NodeFS.rmSync(tempDir, { recursive: true, force: true })),
     );
-    const binaryPath = makeAcpHermesWrapper(tempDir, env);
-    const config = decodeHermesSettings({ binaryPath });
-    const textGeneration = yield* makeHermesTextGeneration(config);
+    const textGeneration = yield* makeHermesTextGeneration(
+      decodeHermesSettings({ binaryPath: makeHermesWrapper(tempDir, input) }),
+    );
     return yield* effectFn(textGeneration);
   }).pipe(Effect.scoped);
 }
 
-function readJsonRpcRequests(
-  filePath: string,
-): ReadonlyArray<{ readonly method?: string; readonly params?: Record<string, unknown> }> {
-  return NodeFS.readFileSync(filePath, "utf8")
-    .trim()
-    .split("\n")
-    .filter((line) => line.length > 0)
-    .map((line) => JSON.parse(line) as { method?: string; params?: Record<string, unknown> });
+function readArgs(filePath: string): ReadonlyArray<string> {
+  return NodeFS.readFileSync(filePath, "utf8").split("\0").filter(Boolean);
 }
 
 it.layer(HermesTextGenerationTestLayer)("HermesTextGeneration", (it) => {
-  it.effect("uses ACP with disabled tool capabilities and forwards the requested model id", () => {
-    const requestLogDir = NodeFS.mkdtempSync(
-      NodePath.join(NodeOS.tmpdir(), "t3code-hermes-text-log-"),
-    );
-    const requestLogPath = NodePath.join(requestLogDir, "requests.ndjson");
-
-    return withFakeAcpHermes(
+  it.effect("uses one-shot mode without agent tools and forwards provider + model", () => {
+    const argsDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3code-hermes-args-"));
+    const argsPath = NodePath.join(argsDir, "args");
+    return withFakeHermes(
       {
-        T3_ACP_REQUEST_LOG_PATH: requestLogPath,
-        T3_ACP_PROMPT_RESPONSE_TEXT: JSON.stringify({
+        argsPath,
+        output: JSON.stringify({
           subject: "Add Hermes provider",
-          body: "Wire up the ACP runtime and headless text generation path.",
+          body: "Use safe one-shot text generation.",
         }),
       },
       (textGeneration) =>
@@ -112,42 +85,35 @@ it.layer(HermesTextGenerationTestLayer)("HermesTextGeneration", (it) => {
           const generated = yield* textGeneration.generateCommitMessage({
             cwd: process.cwd(),
             branch: "feature/hermes",
-            stagedSummary: "M apps/server/src/provider/Layers/HermesAdapter.ts",
-            stagedPatch: "diff --git a/.../HermesAdapter.ts b/.../HermesAdapter.ts",
+            stagedSummary: "M apps/server/src/textGeneration/HermesTextGeneration.ts",
+            stagedPatch: "diff --git a/.../HermesTextGeneration.ts b/.../HermesTextGeneration.ts",
             modelSelection: createModelSelection(ProviderInstanceId.make("hermes"), ALT_MODEL_ID),
           });
 
-          expect(generated.subject).toBe("Add Hermes provider");
-          expect(generated.body).toBe("Wire up the ACP runtime and headless text generation path.");
-
-          const requests = readJsonRpcRequests(requestLogPath);
-          expect(
-            requests.find((request) => request.method === "initialize")?.params?.clientCapabilities,
-          ).toMatchObject({
-            fs: { readTextFile: false, writeTextFile: false },
-            terminal: false,
+          expect(generated).toEqual({
+            subject: "Add Hermes provider",
+            body: "Use safe one-shot text generation.",
           });
-          expect(
-            requests.some(
-              (request) =>
-                request.method === "session/set_model" && request.params?.modelId === ALT_MODEL_ID,
-            ),
-          ).toBe(true);
+          const args = readArgs(argsPath);
+          expect(args).toContain("--oneshot");
+          expect(args).toContain("--ignore-rules");
+          expect(args).toContain("t3-text-generation-no-tools");
+          expect(args).not.toContain("acp");
+          expect(args.slice(args.indexOf("--provider"), args.indexOf("--provider") + 4)).toEqual([
+            "--provider",
+            "openrouter",
+            "--model",
+            "moonshotai/kimi-k2",
+          ]);
         }),
     );
   });
 
-  it.effect("keeps the configured Hermes model when the selection is the default sentinel", () => {
-    const requestLogDir = NodeFS.mkdtempSync(
-      NodePath.join(NodeOS.tmpdir(), "t3code-hermes-text-default-model-"),
-    );
-    const requestLogPath = NodePath.join(requestLogDir, "requests.ndjson");
-
-    return withFakeAcpHermes(
-      {
-        T3_ACP_REQUEST_LOG_PATH: requestLogPath,
-        T3_ACP_PROMPT_RESPONSE_TEXT: JSON.stringify({ title: "Keep the configured model" }),
-      },
+  it.effect("keeps the configured Hermes model for the default sentinel", () => {
+    const argsDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3code-hermes-default-"));
+    const argsPath = NodePath.join(argsDir, "args");
+    return withFakeHermes(
+      { argsPath, output: JSON.stringify({ title: "Keep the configured model" }) },
       (textGeneration) =>
         Effect.gen(function* () {
           const generated = yield* textGeneration.generateThreadTitle({
@@ -155,21 +121,20 @@ it.layer(HermesTextGenerationTestLayer)("HermesTextGeneration", (it) => {
             message: "anything",
             modelSelection: createModelSelection(ProviderInstanceId.make("hermes"), "default"),
           });
-
           expect(generated.title).toBe("Keep the configured model");
-          const requests = readJsonRpcRequests(requestLogPath);
-          expect(requests.some((request) => request.method === "session/set_model")).toBe(false);
+          expect(readArgs(argsPath)).not.toContain("--model");
+          expect(readArgs(argsPath)).not.toContain("--provider");
         }),
     );
   });
 
-  it.effect("extracts the JSON object when Hermes wraps it in conversational text", () =>
-    withFakeAcpHermes(
+  it.effect("extracts JSON from conversational output", () =>
+    withFakeHermes(
       {
-        T3_ACP_PROMPT_RESPONSE_TEXT:
-          "Sure! Here's a thread title:\n\n" +
+        output:
+          "Sure! Here's a title:\n" +
           JSON.stringify({ title: "Investigate failing CI" }) +
-          "\n\nLet me know if you need anything else.",
+          "\nLet me know if you need anything else.",
       },
       (textGeneration) =>
         Effect.gen(function* () {
@@ -183,92 +148,49 @@ it.layer(HermesTextGenerationTestLayer)("HermesTextGeneration", (it) => {
     ),
   );
 
-  it.effect("surfaces ACP request failures as text generation errors", () =>
-    withFakeAcpHermes(
-      {
-        T3_ACP_PROMPT_RESPONSE_TEXT: JSON.stringify({ branch: "unreachable" }),
-      },
-      (textGeneration) =>
-        Effect.gen(function* () {
-          const error = yield* Effect.flip(
-            textGeneration.generateBranchName({
-              cwd: process.cwd(),
-              message: "wire up hermes",
-              modelSelection: createModelSelection(
-                ProviderInstanceId.make("hermes"),
-                "openrouter:missing-hermes-model",
-              ),
-            }),
-          );
-          expect(error._tag).toBe("TextGenerationError");
-          expect(error.detail).toContain("Failed to set Hermes ACP model");
-        }),
-    ),
-  );
-
-  it.effect("fails with TextGenerationError when output is empty", () =>
-    withFakeAcpHermes(
-      {
-        T3_ACP_PROMPT_RESPONSE_TEXT: "   \n  ",
-      },
-      (textGeneration) =>
-        Effect.gen(function* () {
-          const error = yield* Effect.flip(
-            textGeneration.generateThreadTitle({
-              cwd: process.cwd(),
-              message: "anything",
-              modelSelection: createModelSelection(ProviderInstanceId.make("hermes"), ALT_MODEL_ID),
-            }),
-          );
-          expect(error._tag).toBe("TextGenerationError");
-          expect(error.detail).toMatch(/empty/i);
-        }),
-    ),
-  );
-
-  it.effect("decodes a structured PR title + body", () =>
-    withFakeAcpHermes(
-      {
-        T3_ACP_PROMPT_RESPONSE_TEXT: JSON.stringify({
-          title: "feat(hermes): wire up session/set_model",
-          body: "## Summary\n- Switch models through the typed ACP `session/set_model`.\n- Skip the switch for the `default` sentinel.",
-        }),
-      },
-      (textGeneration) =>
-        Effect.gen(function* () {
-          const generated = yield* textGeneration.generatePrContent({
+  it.effect("surfaces CLI failures as text generation errors", () =>
+    withFakeHermes({ output: "provider authentication failed", exitCode: 2 }, (textGeneration) =>
+      Effect.gen(function* () {
+        const error = yield* Effect.flip(
+          textGeneration.generateBranchName({
             cwd: process.cwd(),
-            baseBranch: "main",
-            headBranch: "feat/hermes-provider",
-            commitSummary: "feat: add hermes provider",
-            diffSummary: "M apps/server/src/provider/Layers/HermesAdapter.ts",
-            diffPatch: "diff --git a/.../HermesAdapter.ts b/.../HermesAdapter.ts",
+            message: "wire up hermes",
             modelSelection: createModelSelection(ProviderInstanceId.make("hermes"), ALT_MODEL_ID),
-          });
-
-          expect(generated.title).toBe("feat(hermes): wire up session/set_model");
-          expect(generated.body).toContain("Skip the switch for the `default` sentinel.");
-        }),
+          }),
+        );
+        expect(error._tag).toBe("TextGenerationError");
+        expect(error.detail).toContain("provider authentication failed");
+      }),
     ),
   );
 
-  it.effect("fails with TextGenerationError when output is unparseable JSON", () =>
-    withFakeAcpHermes(
-      {
-        T3_ACP_PROMPT_RESPONSE_TEXT: "totally not json output from a confused model",
-      },
-      (textGeneration) =>
-        Effect.gen(function* () {
-          const error = yield* Effect.flip(
-            textGeneration.generateThreadTitle({
-              cwd: process.cwd(),
-              message: "anything",
-              modelSelection: createModelSelection(ProviderInstanceId.make("hermes"), ALT_MODEL_ID),
-            }),
-          );
-          expect(error._tag).toBe("TextGenerationError");
-          expect(error.detail).toMatch(/invalid structured output/i);
-        }),
+  it.effect("fails when output is empty", () =>
+    withFakeHermes({ output: "" }, (textGeneration) =>
+      Effect.gen(function* () {
+        const error = yield* Effect.flip(
+          textGeneration.generateThreadTitle({
+            cwd: process.cwd(),
+            message: "anything",
+            modelSelection: createModelSelection(ProviderInstanceId.make("hermes"), ALT_MODEL_ID),
+          }),
+        );
+        expect(error.detail).toMatch(/empty/i);
+      }),
+    ),
+  );
+
+  it.effect("fails when output is not valid structured JSON", () =>
+    withFakeHermes({ output: "totally not json" }, (textGeneration) =>
+      Effect.gen(function* () {
+        const error = yield* Effect.flip(
+          textGeneration.generateThreadTitle({
+            cwd: process.cwd(),
+            message: "anything",
+            modelSelection: createModelSelection(ProviderInstanceId.make("hermes"), ALT_MODEL_ID),
+          }),
+        );
+        expect(error.detail).toMatch(/invalid structured output/i);
+      }),
     ),
   );
 });
