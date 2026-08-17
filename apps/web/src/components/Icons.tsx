@@ -211,6 +211,26 @@ export const GrokIcon: Icon = ({ className, ...props }) => (
   </svg>
 );
 
+export const HermesIcon: Icon = ({ className, ...props }) => (
+  <svg
+    {...props}
+    viewBox="0 0 24 24"
+    fill="none"
+    className={cn("stroke-[#0F0F0F] dark:stroke-[#F5F5F5]", className)}
+    strokeWidth="1.8"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+  >
+    {/* Winged-staff mark: the caduceus Hermes carries, reduced to a staff
+        and one wing sweep per side so it stays legible at 16px. */}
+    <path d="M12 3.5v17" />
+    <path d="M12 6.5C10.5 4.5 7.5 4 5 5.5c2 .5 3.5 1.5 4.5 3" />
+    <path d="M12 6.5c1.5-2 4.5-2.5 7-1-2 .5-3.5 1.5-4.5 3" />
+    <path d="M12 11c-1.2-1.6-3.6-2-5.6-.8 1.6.4 2.8 1.2 3.6 2.4" />
+    <path d="M12 11c1.2-1.6 3.6-2 5.6-.8-1.6.4-2.8 1.2-3.6 2.4" />
+  </svg>
+);
+
 export const TraeIcon: Icon = (props) => (
   <svg {...props} viewBox="0 0 24 24" fill="currentColor">
     {/* Back rectangle: left strip + bottom strip drawn separately — empty bottom-left corner is the gap between them */}

@@ -39,6 +39,13 @@ const failPrompt = process.env.T3_ACP_FAIL_PROMPT === "1";
 const failSetConfigOption = process.env.T3_ACP_FAIL_SET_CONFIG_OPTION === "1";
 const exitOnSetConfigOption = process.env.T3_ACP_EXIT_ON_SET_CONFIG_OPTION === "1";
 const promptResponseText = process.env.T3_ACP_PROMPT_RESPONSE_TEXT;
+// Generic surface overrides for agents whose ACP handshake differs from the
+// defaults below: `T3_ACP_AUTH_METHODS` is a JSON `AuthMethod[]` advertised
+// from `initialize`, and `T3_ACP_SESSION_MODELS` is a JSON `ModelInfo[]`
+// replacing the built-in model catalog (session setup then omits
+// `configOptions`, matching agents like Hermes that expose none).
+const authMethodsJson = process.env.T3_ACP_AUTH_METHODS;
+const sessionModelsJson = process.env.T3_ACP_SESSION_MODELS;
 const promptDelayMs = Number(process.env.T3_ACP_PROMPT_DELAY_MS ?? "0");
 const permissionOptionIds = {
   allowOnce: process.env.T3_ACP_ALLOW_ONCE_OPTION_ID ?? "allow-once",
@@ -278,18 +285,40 @@ function modeState(): AcpSchema.SessionModeState {
   };
 }
 
-const grokAcpModels: ReadonlyArray<AcpSchema.ModelInfo> = [
+const defaultAcpModels: ReadonlyArray<AcpSchema.ModelInfo> = [
   { modelId: "grok-build", name: "Grok Build" },
   { modelId: "grok-mock-alt", name: "Grok Mock Alt" },
 ];
 
+const acpModels: ReadonlyArray<AcpSchema.ModelInfo> = sessionModelsJson
+  ? (JSON.parse(sessionModelsJson) as ReadonlyArray<AcpSchema.ModelInfo>)
+  : defaultAcpModels;
+
+function parsedAuthMethods(): ReadonlyArray<AcpSchema.AuthMethod> | undefined {
+  return authMethodsJson
+    ? (JSON.parse(authMethodsJson) as ReadonlyArray<AcpSchema.AuthMethod>)
+    : undefined;
+}
+
 function modelState(): AcpSchema.SessionModelState {
-  const modelId = grokAcpModels.some((model) => model.modelId === currentModelId)
+  const modelId = acpModels.some((model) => model.modelId === currentModelId)
     ? currentModelId
-    : "grok-build";
+    : (acpModels[0]?.modelId ?? "grok-build");
   return {
     currentModelId: modelId,
-    availableModels: grokAcpModels,
+    availableModels: acpModels,
+  };
+}
+
+function sessionSetupExtras(): {
+  readonly modes: AcpSchema.SessionModeState;
+  readonly models: AcpSchema.SessionModelState;
+  readonly configOptions?: ReadonlyArray<AcpSchema.SessionConfigOption>;
+} {
+  return {
+    modes: modeState(),
+    models: modelState(),
+    ...(sessionModelsJson ? {} : { configOptions: configOptions() }),
   };
 }
 
@@ -300,9 +329,11 @@ const program = Effect.gen(function* () {
     Effect.sync(() => {
       parameterizedModelPicker =
         request.clientCapabilities?._meta?.parameterizedModelPicker === true;
+      const authMethods = parsedAuthMethods();
       return {
         protocolVersion: 1,
         agentCapabilities: { loadSession: true },
+        ...(authMethods ? { authMethods } : {}),
       };
     }),
   );
@@ -312,9 +343,7 @@ const program = Effect.gen(function* () {
   yield* agent.handleCreateSession(() =>
     Effect.succeed({
       sessionId,
-      modes: modeState(),
-      models: modelState(),
-      configOptions: configOptions(),
+      ...sessionSetupExtras(),
     }),
   );
 
@@ -356,11 +385,7 @@ const program = Effect.gen(function* () {
           },
         });
         yield* Effect.sleep(loadSessionDelayMs);
-        return {
-          modes: modeState(),
-          models: modelState(),
-          configOptions: configOptions(),
-        };
+        return sessionSetupExtras();
       }
       if (emitLoadReplay) {
         emitLoadReplayNotifications(requestedSessionId);
@@ -372,17 +397,13 @@ const program = Effect.gen(function* () {
           content: { type: "text", text: "replay" },
         },
       });
-      return {
-        modes: modeState(),
-        models: modelState(),
-        configOptions: configOptions(),
-      };
+      return sessionSetupExtras();
     }),
   );
 
   yield* agent.handleSetSessionModel((request) =>
     Effect.gen(function* () {
-      if (!grokAcpModels.some((model) => model.modelId === request.modelId)) {
+      if (!acpModels.some((model) => model.modelId === request.modelId)) {
         return yield* AcpError.AcpRequestError.invalidParams(
           `Unknown mock model id: ${request.modelId}`,
           {

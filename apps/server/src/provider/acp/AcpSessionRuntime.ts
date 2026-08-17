@@ -68,7 +68,18 @@ export interface AcpSessionRuntimeOptions {
     readonly name: string;
     readonly version: string;
   };
-  readonly authMethodId: string;
+  /**
+   * Auth method used for the `authenticate` handshake. Either a static
+   * method id known before the connection opens (Cursor's `cursor_login`,
+   * Grok's environment-derived ids), or a resolver over the agent's
+   * `initialize` response for agents that advertise their method
+   * dynamically (Hermes lists the configured model provider). A resolver
+   * returning `undefined` skips the `authenticate` call entirely — the
+   * agent requires no client-driven auth for the session that follows.
+   */
+  readonly authMethodId:
+    | string
+    | ((initializeResult: EffectAcpSchema.InitializeResponse) => string | undefined);
   readonly mcpServers?: ReadonlyArray<EffectAcpSchema.McpServer>;
   readonly requestLogger?: (event: AcpSessionRequestLogEvent) => Effect.Effect<void, never>;
   readonly protocolLogging?: {
@@ -541,15 +552,21 @@ export const make = (
         acp.agent.initialize(initializePayload),
       );
 
-      const authenticatePayload = {
-        methodId: options.authMethodId,
-      } satisfies EffectAcpSchema.AuthenticateRequest;
+      const authMethodId =
+        typeof options.authMethodId === "function"
+          ? options.authMethodId(initializeResult)
+          : options.authMethodId;
+      if (authMethodId !== undefined) {
+        const authenticatePayload = {
+          methodId: authMethodId,
+        } satisfies EffectAcpSchema.AuthenticateRequest;
 
-      yield* runLoggedRequest(
-        "authenticate",
-        authenticatePayload,
-        acp.agent.authenticate(authenticatePayload),
-      );
+        yield* runLoggedRequest(
+          "authenticate",
+          authenticatePayload,
+          acp.agent.authenticate(authenticatePayload),
+        );
+      }
 
       let sessionId: string;
       let sessionSetupResult:
