@@ -20,6 +20,7 @@ import {
   parseGenericCliVersion,
   providerModelsFromSettings,
   spawnAndCollect,
+  type ProviderProbeResult,
   type ServerProviderDraft,
 } from "../providerSnapshot.ts";
 import {
@@ -146,20 +147,22 @@ export const checkHermesProviderStatus = Effect.fn("checkHermesProviderStatus")(
 ): Effect.fn.Return<ServerProviderDraft, never, ChildProcessSpawner.ChildProcessSpawner> {
   const checkedAt = DateTime.formatIso(yield* DateTime.now);
   const fallbackModels = hermesModelsFromSettings(hermesSettings.customModels);
-
-  if (!hermesSettings.enabled) {
-    return buildServerProvider({
+  const snapshot = (probe: ProviderProbeResult) =>
+    buildServerProvider({
       presentation: HERMES_PRESENTATION,
-      enabled: false,
+      enabled: hermesSettings.enabled,
       checkedAt,
       models: fallbackModels,
-      probe: {
-        installed: false,
-        version: null,
-        status: "warning",
-        auth: { status: "unknown" },
-        message: "Hermes is disabled in T3 Code settings.",
-      },
+      probe,
+    });
+
+  if (!hermesSettings.enabled) {
+    return snapshot({
+      installed: false,
+      version: null,
+      status: "warning",
+      auth: { status: "unknown" },
+      message: "Hermes is disabled in T3 Code settings.",
     });
   }
 
@@ -173,36 +176,24 @@ export const checkHermesProviderStatus = Effect.fn("checkHermesProviderStatus")(
     yield* Effect.logWarning("Hermes CLI health check failed.", {
       errorTag: error._tag,
     });
-    return buildServerProvider({
-      presentation: HERMES_PRESENTATION,
-      enabled: hermesSettings.enabled,
-      checkedAt,
-      models: fallbackModels,
-      probe: {
-        installed: !isCommandMissingCause(error),
-        version: null,
-        status: "error",
-        auth: { status: "unknown" },
-        message: isCommandMissingCause(error)
-          ? "Hermes Agent CLI (`hermes`) is not installed or not on PATH."
-          : "Failed to execute Hermes CLI health check.",
-      },
+    return snapshot({
+      installed: !isCommandMissingCause(error),
+      version: null,
+      status: "error",
+      auth: { status: "unknown" },
+      message: isCommandMissingCause(error)
+        ? "Hermes Agent CLI (`hermes`) is not installed or not on PATH."
+        : "Failed to execute Hermes CLI health check.",
     });
   }
 
   if (Option.isNone(versionResult.success)) {
-    return buildServerProvider({
-      presentation: HERMES_PRESENTATION,
-      enabled: hermesSettings.enabled,
-      checkedAt,
-      models: fallbackModels,
-      probe: {
-        installed: true,
-        version: null,
-        status: "error",
-        auth: { status: "unknown" },
-        message: "Hermes CLI is installed but timed out while running `hermes --version`.",
-      },
+    return snapshot({
+      installed: true,
+      version: null,
+      status: "error",
+      auth: { status: "unknown" },
+      message: "Hermes CLI is installed but timed out while running `hermes --version`.",
     });
   }
 
@@ -214,18 +205,12 @@ export const checkHermesProviderStatus = Effect.fn("checkHermesProviderStatus")(
       stdoutLength: versionOutput.stdout.length,
       stderrLength: versionOutput.stderr.length,
     });
-    return buildServerProvider({
-      presentation: HERMES_PRESENTATION,
-      enabled: hermesSettings.enabled,
-      checkedAt,
-      models: fallbackModels,
-      probe: {
-        installed: true,
-        version,
-        status: "error",
-        auth: { status: "unknown" },
-        message: "Hermes CLI is installed but failed to run.",
-      },
+    return snapshot({
+      installed: true,
+      version,
+      status: "error",
+      auth: { status: "unknown" },
+      message: "Hermes CLI is installed but failed to run.",
     });
   }
 
@@ -237,36 +222,24 @@ export const checkHermesProviderStatus = Effect.fn("checkHermesProviderStatus")(
     yield* Effect.logWarning("Hermes ACP health check failed", {
       errorTag: acpCheckResult.failure._tag,
     });
-    return buildServerProvider({
-      presentation: HERMES_PRESENTATION,
-      enabled: hermesSettings.enabled,
-      checkedAt,
-      models: fallbackModels,
-      probe: {
-        installed: true,
-        version,
-        status: "error",
-        auth: { status: "unknown" },
-        message: "Failed to execute `hermes acp --check`.",
-      },
+    return snapshot({
+      installed: true,
+      version,
+      status: "error",
+      auth: { status: "unknown" },
+      message: "Failed to execute `hermes acp --check`.",
     });
   }
   if (Option.isNone(acpCheckResult.success)) {
     yield* Effect.logWarning(
       `Hermes ACP health check timed out after ${HERMES_ACP_CHECK_TIMEOUT_MS}ms.`,
     );
-    return buildServerProvider({
-      presentation: HERMES_PRESENTATION,
-      enabled: hermesSettings.enabled,
-      checkedAt,
-      models: fallbackModels,
-      probe: {
-        installed: true,
-        version,
-        status: "error",
-        auth: { status: "unknown" },
-        message: `Hermes ACP health check timed out after ${HERMES_ACP_CHECK_TIMEOUT_MS}ms.`,
-      },
+    return snapshot({
+      installed: true,
+      version,
+      status: "error",
+      auth: { status: "unknown" },
+      message: `Hermes ACP health check timed out after ${HERMES_ACP_CHECK_TIMEOUT_MS}ms.`,
     });
   }
 
@@ -277,32 +250,20 @@ export const checkHermesProviderStatus = Effect.fn("checkHermesProviderStatus")(
       stdoutLength: acpCheckOutput.stdout.length,
       stderrLength: acpCheckOutput.stderr.length,
     });
-    return buildServerProvider({
-      presentation: HERMES_PRESENTATION,
-      enabled: hermesSettings.enabled,
-      checkedAt,
-      models: fallbackModels,
-      probe: {
-        installed: true,
-        version,
-        status: "error",
-        auth: { status: "unknown" },
-        message: hermesAcpCheckFailureMessage(acpCheckOutput.stdout, acpCheckOutput.stderr),
-      },
+    return snapshot({
+      installed: true,
+      version,
+      status: "error",
+      auth: { status: "unknown" },
+      message: hermesAcpCheckFailureMessage(acpCheckOutput.stdout, acpCheckOutput.stderr),
     });
   }
 
-  return buildServerProvider({
-    presentation: HERMES_PRESENTATION,
-    enabled: hermesSettings.enabled,
-    checkedAt,
-    models: fallbackModels,
-    probe: {
-      installed: true,
-      version,
-      status: "ready",
-      auth: { status: "unknown" },
-    },
+  return snapshot({
+    installed: true,
+    version,
+    status: "ready",
+    auth: { status: "unknown" },
   });
 });
 

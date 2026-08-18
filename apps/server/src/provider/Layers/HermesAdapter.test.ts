@@ -248,6 +248,13 @@ it.layer(hermesAdapterTestLayer)("HermesAdapterLive", (it) => {
       );
       const adapter = yield* makeTestAdapter(wrapperPath);
 
+      const runtimeEvents: ProviderRuntimeEvent[] = [];
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }),
+      ).pipe(Effect.forkChild);
+
       yield* adapter.startSession({
         threadId,
         provider: ProviderDriverKind.make("hermes"),
@@ -294,6 +301,20 @@ it.layer(hermesAdapterTestLayer)("HermesAdapterLive", (it) => {
       assert.include(promptTexts, "/steer focus on the tests");
 
       yield* Fiber.join(firstTurnFiber);
+      yield* Fiber.interrupt(runtimeEventsFiber);
+
+      // Both the original prompt and the steer count toward the turn: it
+      // completes exactly once, after the steered output has streamed.
+      const completedIndexes = runtimeEvents.flatMap((event, index) =>
+        event.type === "turn.completed" ? [index] : [],
+      );
+      const deltaIndexes = runtimeEvents.flatMap((event, index) =>
+        event.type === "content.delta" ? [index] : [],
+      );
+      assert.lengthOf(completedIndexes, 1);
+      assert.isAtLeast(deltaIndexes.length, 2);
+      assert.isAbove(completedIndexes[0] ?? -1, Math.max(...deltaIndexes));
+
       yield* adapter.stopSession(threadId);
     }).pipe(TestClock.withLive),
   );
@@ -407,6 +428,44 @@ it.layer(hermesAdapterTestLayer)("HermesAdapterLive", (it) => {
 
       assert.equal(session.model, DEFAULT_MODEL_ID);
       assert.notInclude(methods, "session/set_model");
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("switches back to the session default model when a turn re-selects the sentinel", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("hermes-default-model-switch-back");
+      const tempDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "hermes-acp-model-switch-back-")),
+      );
+      const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockHermesWrapper({ T3_ACP_REQUEST_LOG_PATH: requestLogPath }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("hermes"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        modelSelection: { instanceId: ProviderInstanceId.make("hermes"), model: ALT_MODEL_ID },
+      });
+      yield* adapter.sendTurn({
+        threadId,
+        input: "back to the default model",
+        attachments: [],
+        modelSelection: { instanceId: ProviderInstanceId.make("hermes"), model: "default" },
+      });
+
+      const requests = yield* Effect.promise(() => readJsonLines(requestLogPath));
+      assert.deepEqual(
+        requests
+          .filter((entry) => entry.method === "session/set_model")
+          .map((entry) => entry.params?.modelId),
+        [ALT_MODEL_ID, DEFAULT_MODEL_ID],
+      );
 
       yield* adapter.stopSession(threadId);
     }),

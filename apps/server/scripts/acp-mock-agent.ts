@@ -309,12 +309,12 @@ function modelState(): AcpSchema.SessionModelState {
 function sessionSetupExtras(): {
   readonly modes: AcpSchema.SessionModeState;
   readonly models: AcpSchema.SessionModelState;
-  readonly configOptions?: ReadonlyArray<AcpSchema.SessionConfigOption>;
+  readonly configOptions: ReadonlyArray<AcpSchema.SessionConfigOption>;
 } {
   return {
     modes: modeState(),
     models: modelState(),
-    ...(sessionModelsJson ? {} : { configOptions: configOptions() }),
+    configOptions: configOptions(),
   };
 }
 

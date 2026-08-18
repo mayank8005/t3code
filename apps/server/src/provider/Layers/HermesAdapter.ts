@@ -97,6 +97,8 @@ interface HermesSessionContext {
   interruptedTurnIds: Set<TurnId>;
   promptsInFlight: number;
   currentModelId: string | undefined;
+  /** The model the ACP session reported at setup; the default sentinel switches back to it. */
+  readonly defaultModelId: string | undefined;
   stopped: boolean;
 }
 
@@ -145,13 +147,14 @@ function selectPermissionOptionId(
   request: EffectAcpSchema.RequestPermissionRequest,
   decision: Exclude<ProviderApprovalDecision, "cancel">,
 ): string | undefined {
-  const optionId =
+  const kind =
     decision === "acceptForSession"
-      ? "allow_session"
+      ? "allow_always"
       : decision === "accept"
         ? "allow_once"
-        : "deny";
-  return request.options.find((entry) => entry.optionId.trim() === optionId)?.optionId;
+        : "reject_once";
+  const option = request.options.find((entry) => entry.kind === kind);
+  return option?.optionId.trim() || undefined;
 }
 
 function selectAutoApprovedPermissionOption(
@@ -632,9 +635,12 @@ export function makeHermesAdapter(
           );
 
           const requestedStartModelId = resolveHermesAcpModelId(hermesModelSelection?.model);
+          const sessionDefaultModelId = currentHermesModelIdFromSessionSetup(
+            started.sessionSetupResult,
+          );
           const boundModelId = yield* applyHermesAcpModelSelection({
             runtime: acp,
-            currentModelId: currentHermesModelIdFromSessionSetup(started.sessionSetupResult),
+            currentModelId: sessionDefaultModelId,
             requestedModelId: requestedStartModelId,
             mapError: (cause) =>
               mapAcpToAdapterError(PROVIDER, input.threadId, "session/set_model", cause),
@@ -671,6 +677,7 @@ export function makeHermesAdapter(
             interruptedTurnIds: new Set(),
             promptsInFlight: 0,
             currentModelId: boundModelId,
+            defaultModelId: sessionDefaultModelId,
             stopped: false,
           };
 
@@ -819,9 +826,14 @@ export function makeHermesAdapter(
                   issue: "Hermes steering requires non-empty text without attachments.",
                 });
               }
+              // Count the steer prompt like any other so the superseded
+              // in-flight prompt resolving first cannot settle the turn
+              // while the steer is still streaming.
+              ctx.promptsInFlight += 1;
               return {
                 _tag: "Steer" as const,
                 acp: ctx.acp,
+                acpSessionId: ctx.acpSessionId,
                 turnId: steeringTurnId,
                 text,
                 resumeCursor: ctx.session.resumeCursor,
@@ -843,7 +855,12 @@ export function makeHermesAdapter(
                 input.modelSelection?.instanceId === boundInstanceId
                   ? input.modelSelection
                   : undefined;
-              const requestedTurnModelId = resolveHermesAcpModelId(turnModelSelection?.model);
+              // Selecting the default sentinel switches back to the model the
+              // session reported at setup; Hermes has no addressable
+              // "default" model id.
+              const requestedTurnModelId = turnModelSelection
+                ? (resolveHermesAcpModelId(turnModelSelection.model) ?? ctx.defaultModelId)
+                : undefined;
               const currentModelId = yield* applyHermesAcpModelSelection({
                 runtime: ctx.acp,
                 currentModelId: ctx.currentModelId,
@@ -959,18 +976,75 @@ export function makeHermesAdapter(
           }),
         );
         if (prepared._tag === "Steer") {
-          yield* prepared.acp
-            .steer(prepared.text)
-            .pipe(
+          const steerSettled = yield* Ref.make(false);
+          return yield* Effect.gen(function* () {
+            const result = yield* prepared.acp.steer(prepared.text).pipe(
               Effect.mapError((error) =>
                 mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
               ),
+              Effect.tapError(() =>
+                withThreadLock(
+                  input.threadId,
+                  settlePromptInFlight(input.threadId, prepared.turnId, prepared.acpSessionId, {
+                    errorMessage: "Hermes steering prompt failed.",
+                  }).pipe(Effect.andThen(Ref.set(steerSettled, true))),
+                ),
+              ),
             );
-          return {
-            threadId: input.threadId,
-            turnId: prepared.turnId,
-            resumeCursor: prepared.resumeCursor,
-          };
+            yield* withThreadLock(
+              input.threadId,
+              Effect.gen(function* () {
+                const ctx = sessions.get(input.threadId);
+                if (ctx && ctx.acpSessionId === prepared.acpSessionId) {
+                  // Keep prompt settlement atomic with respect to Stop.
+                  // interruptTurn marks its target before waiting for this
+                  // lock, so cancellation can still win while queued ACP
+                  // events are drained.
+                  for (let yieldAttempt = 0; yieldAttempt < 8; yieldAttempt += 1) {
+                    yield* Effect.yieldNow;
+                  }
+                  yield* prepared.acp.drainEvents;
+                  if (!ctx.interruptedTurnIds.has(prepared.turnId)) {
+                    appendPromptResultToTurn(
+                      ctx,
+                      prepared.turnId,
+                      [{ type: "text", text: prepared.text }],
+                      result,
+                    );
+                  }
+                }
+                yield* settlePromptInFlight(
+                  input.threadId,
+                  prepared.turnId,
+                  prepared.acpSessionId,
+                  {
+                    completedStopReason: result.stopReason,
+                  },
+                );
+                yield* Ref.set(steerSettled, true);
+              }),
+            );
+            return {
+              threadId: input.threadId,
+              turnId: prepared.turnId,
+              resumeCursor: prepared.resumeCursor,
+            };
+          }).pipe(
+            Effect.ensuring(
+              Effect.gen(function* () {
+                if (yield* Ref.get(steerSettled)) {
+                  return;
+                }
+                yield* withThreadLock(
+                  input.threadId,
+                  settlePromptInFlight(input.threadId, prepared.turnId, prepared.acpSessionId, {
+                    completedStopReason: "cancelled",
+                    emitTurnCompletion: false,
+                  }),
+                );
+              }).pipe(Effect.catch(() => Effect.void)),
+            ),
+          );
         }
 
         const promptSettled = yield* Ref.make(false);
@@ -1025,6 +1099,9 @@ export function makeHermesAdapter(
                   detail: "Hermes session changed before the turn completed.",
                 });
               }
+              // Keep prompt settlement atomic with respect to Stop and steering.
+              // interruptTurn marks its target before waiting for this lock, so
+              // cancellation can still win while queued ACP events are drained.
               for (let yieldAttempt = 0; yieldAttempt < 8; yieldAttempt += 1) {
                 yield* Effect.yieldNow;
               }

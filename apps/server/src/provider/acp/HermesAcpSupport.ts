@@ -1,11 +1,14 @@
 import { type HermesSettings } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 import * as EffectAcpErrors from "effect-acp/errors";
-import type * as EffectAcpSchema from "effect-acp/schema";
+import * as EffectAcpSchema from "effect-acp/schema";
 
 import * as AcpSessionRuntime from "./AcpSessionRuntime.ts";
 
@@ -24,7 +27,9 @@ interface HermesAcpRuntimeInput extends Omit<
 }
 
 export type HermesAcpRuntime = AcpSessionRuntime.AcpSessionRuntime["Service"] & {
-  readonly steer: (text: string) => Effect.Effect<void, EffectAcpErrors.AcpError>;
+  readonly steer: (
+    text: string,
+  ) => Effect.Effect<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError>;
 };
 
 export function buildHermesAcpSpawnInput(
@@ -52,10 +57,13 @@ export function resolveHermesAcpAuthMethodId(
   return undefined;
 }
 
+const decodeSteerPromptResponse = Schema.decodeUnknownEffect(EffectAcpSchema.PromptResponse);
+
 export const makeHermesAcpRuntime = (
   input: HermesAcpRuntimeInput,
 ): Effect.Effect<HermesAcpRuntime, EffectAcpErrors.AcpError, Crypto.Crypto | Scope.Scope> =>
   Effect.gen(function* () {
+    const scope = yield* Effect.scope;
     const acpContext = yield* Layer.build(
       AcpSessionRuntime.layer({
         ...input,
@@ -70,15 +78,43 @@ export const makeHermesAcpRuntime = (
     const runtime = yield* Effect.service(AcpSessionRuntime.AcpSessionRuntime).pipe(
       Effect.provide(acpContext),
     );
+    // Steer prompts run outside the serialized prompt path (the active
+    // prompt holds its permit for the whole turn), so cancel has to
+    // interrupt them explicitly; track the live steer request fibers.
+    const steerFibers = new Set<Fiber.Fiber<unknown, EffectAcpErrors.AcpError>>();
     return {
       ...runtime,
+      cancel: Effect.suspend(() =>
+        Effect.forEach(steerFibers, (fiber) => Fiber.interrupt(fiber).pipe(Effect.ignore), {
+          discard: true,
+        }),
+      ).pipe(Effect.andThen(runtime.cancel)),
       steer: (text) =>
         Effect.gen(function* () {
           const started = yield* runtime.start();
-          yield* runtime.request("session/prompt", {
-            sessionId: started.sessionId,
-            prompt: [{ type: "text", text: `/steer ${text}` }],
-          } satisfies EffectAcpSchema.PromptRequest);
+          const fiber = yield* runtime
+            .request("session/prompt", {
+              sessionId: started.sessionId,
+              prompt: [{ type: "text", text: `/steer ${text}` }],
+            } satisfies EffectAcpSchema.PromptRequest)
+            .pipe(Effect.forkIn(scope));
+          steerFibers.add(fiber);
+          const response = yield* Fiber.join(fiber).pipe(
+            Effect.catchCause(
+              (cause): Effect.Effect<unknown, EffectAcpErrors.AcpError> =>
+                Cause.hasInterruptsOnly(cause)
+                  ? Effect.succeed({
+                      stopReason: "cancelled",
+                    } satisfies EffectAcpSchema.PromptResponse)
+                  : Effect.failCause(cause),
+            ),
+            Effect.ensuring(Effect.sync(() => steerFibers.delete(fiber))),
+          );
+          return yield* decodeSteerPromptResponse(response).pipe(
+            Effect.orElseSucceed(
+              (): EffectAcpSchema.PromptResponse => ({ stopReason: "end_turn" }),
+            ),
+          );
         }),
     };
   });
