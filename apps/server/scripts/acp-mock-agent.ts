@@ -23,6 +23,8 @@ const emitXAiPromptCompleteThenHang = process.env.T3_ACP_EMIT_XAI_PROMPT_COMPLET
 const emitForeignSessionUpdates = process.env.T3_ACP_EMIT_FOREIGN_SESSION_UPDATES === "1";
 const hangPromptForever = process.env.T3_ACP_HANG_PROMPT_FOREVER === "1";
 const hangFirstPromptForever = process.env.T3_ACP_HANG_FIRST_PROMPT_FOREVER === "1";
+const hangPromptUntilSteer = process.env.T3_ACP_HANG_PROMPT_UNTIL_STEER === "1";
+const emitMessageThenHang = process.env.T3_ACP_EMIT_MESSAGE_THEN_HANG === "1";
 const emitLateUpdateAfterCancel = process.env.T3_ACP_EMIT_LATE_UPDATE_AFTER_CANCEL === "1";
 const omitXAiPromptCompleteStopReason =
   process.env.T3_ACP_OMIT_XAI_PROMPT_COMPLETE_STOP_REASON === "1";
@@ -39,9 +41,12 @@ const failPrompt = process.env.T3_ACP_FAIL_PROMPT === "1";
 const failSetConfigOption = process.env.T3_ACP_FAIL_SET_CONFIG_OPTION === "1";
 const exitOnSetConfigOption = process.env.T3_ACP_EXIT_ON_SET_CONFIG_OPTION === "1";
 const promptResponseText = process.env.T3_ACP_PROMPT_RESPONSE_TEXT;
+const authMethodsJson = process.env.T3_ACP_AUTH_METHODS;
+const sessionModelsJson = process.env.T3_ACP_SESSION_MODELS;
 const promptDelayMs = Number(process.env.T3_ACP_PROMPT_DELAY_MS ?? "0");
 const permissionOptionIds = {
   allowOnce: process.env.T3_ACP_ALLOW_ONCE_OPTION_ID ?? "allow-once",
+  allowSession: process.env.T3_ACP_ALLOW_SESSION_OPTION_ID,
   allowAlways: process.env.T3_ACP_ALLOW_ALWAYS_OPTION_ID ?? "allow-always",
   rejectOnce: process.env.T3_ACP_REJECT_ONCE_OPTION_ID ?? "reject-once",
 };
@@ -55,6 +60,8 @@ let currentContext = "272k";
 let currentFast = false;
 let promptCount = 0;
 let overlappingFirstPromptId: string | undefined;
+let steerReleased = false;
+let releaseHangingPrompt: (() => void) | undefined;
 const cancelledSessions = new Set<string>();
 
 function promptIdFromRequestMeta(
@@ -66,6 +73,11 @@ function promptIdFromRequestMeta(
   }
   const promptId = meta.promptId ?? meta.requestId;
   return typeof promptId === "string" && promptId.length > 0 ? promptId : undefined;
+}
+
+function firstPromptText(request: Pick<AcpSchema.PromptRequest, "prompt">): string | undefined {
+  const part = request.prompt.find((entry) => entry.type === "text");
+  return part?.type === "text" ? part.text : undefined;
 }
 
 function logExit(reason: string): void {
@@ -253,23 +265,29 @@ function availableModels(): ReadonlyArray<{
   }));
 }
 
-const availableModes: ReadonlyArray<AcpSchema.SessionMode> = [
-  {
-    id: "ask",
-    name: "Ask",
-    description: "Request permission before making any changes",
-  },
-  {
-    id: "architect",
-    name: "Architect",
-    description: "Design and plan software systems without implementation",
-  },
-  {
-    id: "code",
-    name: "Code",
-    description: "Write and modify code with full tool access",
-  },
-];
+const availableModesJson = process.env.T3_ACP_AVAILABLE_MODES;
+const availableModes: ReadonlyArray<AcpSchema.SessionMode> = availableModesJson
+  ? (JSON.parse(availableModesJson) as ReadonlyArray<AcpSchema.SessionMode>)
+  : [
+      {
+        id: "ask",
+        name: "Ask",
+        description: "Request permission before making any changes",
+      },
+      {
+        id: "architect",
+        name: "Architect",
+        description: "Design and plan software systems without implementation",
+      },
+      {
+        id: "code",
+        name: "Code",
+        description: "Write and modify code with full tool access",
+      },
+    ];
+if (availableModesJson) {
+  currentModeId = availableModes[0]?.id ?? currentModeId;
+}
 
 function modeState(): AcpSchema.SessionModeState {
   return {
@@ -278,18 +296,40 @@ function modeState(): AcpSchema.SessionModeState {
   };
 }
 
-const grokAcpModels: ReadonlyArray<AcpSchema.ModelInfo> = [
+const defaultAcpModels: ReadonlyArray<AcpSchema.ModelInfo> = [
   { modelId: "grok-build", name: "Grok Build" },
   { modelId: "grok-mock-alt", name: "Grok Mock Alt" },
 ];
 
+const acpModels: ReadonlyArray<AcpSchema.ModelInfo> = sessionModelsJson
+  ? (JSON.parse(sessionModelsJson) as ReadonlyArray<AcpSchema.ModelInfo>)
+  : defaultAcpModels;
+
+function parsedAuthMethods(): ReadonlyArray<AcpSchema.AuthMethod> | undefined {
+  return authMethodsJson
+    ? (JSON.parse(authMethodsJson) as ReadonlyArray<AcpSchema.AuthMethod>)
+    : undefined;
+}
+
 function modelState(): AcpSchema.SessionModelState {
-  const modelId = grokAcpModels.some((model) => model.modelId === currentModelId)
+  const modelId = acpModels.some((model) => model.modelId === currentModelId)
     ? currentModelId
-    : "grok-build";
+    : (acpModels[0]?.modelId ?? "grok-build");
   return {
     currentModelId: modelId,
-    availableModels: grokAcpModels,
+    availableModels: acpModels,
+  };
+}
+
+function sessionSetupExtras(): {
+  readonly modes: AcpSchema.SessionModeState;
+  readonly models: AcpSchema.SessionModelState;
+  readonly configOptions: ReadonlyArray<AcpSchema.SessionConfigOption>;
+} {
+  return {
+    modes: modeState(),
+    models: modelState(),
+    configOptions: configOptions(),
   };
 }
 
@@ -300,9 +340,11 @@ const program = Effect.gen(function* () {
     Effect.sync(() => {
       parameterizedModelPicker =
         request.clientCapabilities?._meta?.parameterizedModelPicker === true;
+      const authMethods = parsedAuthMethods();
       return {
         protocolVersion: 1,
         agentCapabilities: { loadSession: true },
+        ...(authMethods ? { authMethods } : {}),
       };
     }),
   );
@@ -312,9 +354,7 @@ const program = Effect.gen(function* () {
   yield* agent.handleCreateSession(() =>
     Effect.succeed({
       sessionId,
-      modes: modeState(),
-      models: modelState(),
-      configOptions: configOptions(),
+      ...sessionSetupExtras(),
     }),
   );
 
@@ -356,11 +396,7 @@ const program = Effect.gen(function* () {
           },
         });
         yield* Effect.sleep(loadSessionDelayMs);
-        return {
-          modes: modeState(),
-          models: modelState(),
-          configOptions: configOptions(),
-        };
+        return sessionSetupExtras();
       }
       if (emitLoadReplay) {
         emitLoadReplayNotifications(requestedSessionId);
@@ -372,17 +408,13 @@ const program = Effect.gen(function* () {
           content: { type: "text", text: "replay" },
         },
       });
-      return {
-        modes: modeState(),
-        models: modelState(),
-        configOptions: configOptions(),
-      };
+      return sessionSetupExtras();
     }),
   );
 
   yield* agent.handleSetSessionModel((request) =>
     Effect.gen(function* () {
-      if (!grokAcpModels.some((model) => model.modelId === request.modelId)) {
+      if (!acpModels.some((model) => model.modelId === request.modelId)) {
         return yield* AcpError.AcpRequestError.invalidParams(
           `Unknown mock model id: ${request.modelId}`,
           {
@@ -519,6 +551,49 @@ const program = Effect.gen(function* () {
       }
 
       if (hangPromptForever || (hangFirstPromptForever && promptCount === 1)) {
+        return yield* Effect.never;
+      }
+
+      if (hangPromptUntilSteer) {
+        if (firstPromptText(request)?.startsWith("/steer ")) {
+          yield* agent.client.sessionUpdate({
+            sessionId: requestedSessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "steered output" },
+            },
+          });
+          steerReleased = true;
+          releaseHangingPrompt?.();
+          releaseHangingPrompt = undefined;
+          return { stopReason: "end_turn" };
+        }
+        if (!steerReleased) {
+          yield* Effect.promise(
+            () =>
+              new Promise<void>((resolve) => {
+                releaseHangingPrompt = resolve;
+              }),
+          );
+        }
+        yield* agent.client.sessionUpdate({
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: promptResponseText ?? "hello from mock" },
+          },
+        });
+        return { stopReason: "end_turn" };
+      }
+
+      if (emitMessageThenHang) {
+        yield* agent.client.sessionUpdate({
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: promptResponseText ?? "hello from mock" },
+          },
+        });
         return yield* Effect.never;
       }
 
@@ -675,11 +750,24 @@ const program = Effect.gen(function* () {
           },
           options: [
             { optionId: permissionOptionIds.allowOnce, name: "Allow once", kind: "allow_once" },
-            {
-              optionId: permissionOptionIds.allowAlways,
-              name: "Allow always",
-              kind: "allow_always",
-            },
+            ...(permissionOptionIds.allowSession
+              ? [
+                  {
+                    optionId: permissionOptionIds.allowSession,
+                    name: "Allow for session",
+                    kind: "allow_always" as const,
+                  },
+                ]
+              : []),
+            ...(permissionOptionIds.allowAlways
+              ? [
+                  {
+                    optionId: permissionOptionIds.allowAlways,
+                    name: "Allow always",
+                    kind: "allow_always" as const,
+                  },
+                ]
+              : []),
             { optionId: permissionOptionIds.rejectOnce, name: "Reject", kind: "reject_once" },
           ],
         });
@@ -884,7 +972,7 @@ const program = Effect.gen(function* () {
       });
     }
 
-    if (method !== "session/mode/set") {
+    if (method !== "session/mode/set" && method !== "session/set_mode") {
       return Effect.fail(AcpError.AcpRequestError.methodNotFound(method));
     }
 
