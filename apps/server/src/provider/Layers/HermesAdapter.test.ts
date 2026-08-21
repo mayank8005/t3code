@@ -132,6 +132,26 @@ function selectedPermissionOptionIds(
   );
 }
 
+function promptTextsFromRequests(
+  requests: ReadonlyArray<RecordedJsonRpcMessage>,
+): ReadonlyArray<string> {
+  return requests.flatMap((request) => {
+    if (request.method !== "session/prompt" || !Array.isArray(request.params?.prompt)) {
+      return [];
+    }
+    return request.params.prompt.flatMap((part) =>
+      typeof part === "object" &&
+      part !== null &&
+      "type" in part &&
+      part.type === "text" &&
+      "text" in part &&
+      typeof part.text === "string"
+        ? [part.text]
+        : [],
+    );
+  });
+}
+
 const hermesAdapterTestLayer = ServerConfig.layerTest(process.cwd(), {
   prefix: "t3code-hermes-adapter-test-",
 }).pipe(Layer.provideMerge(NodeServices.layer));
@@ -287,21 +307,7 @@ it.layer(hermesAdapterTestLayer)("HermesAdapterLive", (it) => {
       yield* waitForFileContent(requestLogPath, 40, "/steer focus on the tests");
 
       const requests = yield* Effect.promise(() => readJsonLines(requestLogPath));
-      const promptTexts = requests.flatMap((request) => {
-        if (request.method !== "session/prompt" || !Array.isArray(request.params?.prompt)) {
-          return [];
-        }
-        return request.params.prompt.flatMap((part) =>
-          typeof part === "object" &&
-          part !== null &&
-          "type" in part &&
-          part.type === "text" &&
-          "text" in part &&
-          typeof part.text === "string"
-            ? [part.text]
-            : [],
-        );
-      });
+      const promptTexts = promptTextsFromRequests(requests);
       assert.equal(followUp.turnId, turnId);
       assert.include(promptTexts, "/steer focus on the tests");
 
@@ -320,6 +326,54 @@ it.layer(hermesAdapterTestLayer)("HermesAdapterLive", (it) => {
       assert.isAtLeast(deltaIndexes.length, 2);
       assert.isAbove(completedIndexes[0] ?? -1, Math.max(...deltaIndexes));
 
+      yield* adapter.stopSession(threadId);
+    }).pipe(TestClock.withLive),
+  );
+
+  it.effect("does not dispatch a steer after Stop interrupts its preparation", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("hermes-stop-during-steer-preparation");
+      const tempDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "hermes-acp-steer-cancel-race-")),
+      );
+      const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockHermesWrapper({
+          T3_ACP_HANG_FIRST_PROMPT_FOREVER: "1",
+          T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+        }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("hermes"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      const firstTurnFiber = yield* adapter
+        .sendTurn({ threadId, input: "start the task", attachments: [] })
+        .pipe(Effect.forkChild);
+      yield* waitForFileContent(requestLogPath, 80, "start the task");
+
+      const activeSession = (yield* adapter.listSessions()).find(
+        (session) => session.threadId === threadId && session.activeTurnId !== undefined,
+      );
+      const turnId = activeSession?.activeTurnId;
+      assert.isDefined(turnId);
+      const followUpErrorFiber = yield* Effect.flip(
+        adapter.sendTurn({ threadId, input: "steer after stop", attachments: [] }),
+      ).pipe(Effect.forkChild({ startImmediately: true }));
+
+      yield* adapter.interruptTurn(threadId, turnId).pipe(Effect.timeout("2 seconds"));
+      const followUpError = yield* Fiber.join(followUpErrorFiber).pipe(Effect.timeout("2 seconds"));
+      const requests = yield* Effect.promise(() => readJsonLines(requestLogPath));
+      const promptTexts = promptTextsFromRequests(requests);
+
+      assert.equal(followUpError._tag, "ProviderAdapterRequestError");
+      assert.deepEqual(promptTexts, ["start the task"]);
+
+      yield* Fiber.interrupt(firstTurnFiber);
       yield* adapter.stopSession(threadId);
     }).pipe(TestClock.withLive),
   );

@@ -17,6 +17,11 @@ export const HERMES_SETUP_AUTH_METHOD_ID = "hermes-setup";
 
 type HermesAcpRuntimeHermesSettings = Pick<HermesSettings, "binaryPath">;
 
+export interface HermesAcpSteerRequest {
+  readonly cancel: Effect.Effect<void>;
+  readonly result: Effect.Effect<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError>;
+}
+
 interface HermesAcpRuntimeInput extends Omit<
   AcpSessionRuntime.AcpSessionRuntimeOptions,
   "authMethodId" | "clientCapabilities" | "spawn"
@@ -27,9 +32,9 @@ interface HermesAcpRuntimeInput extends Omit<
 }
 
 export type HermesAcpRuntime = AcpSessionRuntime.AcpSessionRuntime["Service"] & {
-  readonly steer: (
+  readonly startSteer: (
     text: string,
-  ) => Effect.Effect<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError>;
+  ) => Effect.Effect<HermesAcpSteerRequest, EffectAcpErrors.AcpError>;
   readonly setSessionMode: (modeId: string) => Effect.Effect<void, EffectAcpErrors.AcpError>;
 };
 
@@ -90,7 +95,7 @@ export const makeHermesAcpRuntime = (
           discard: true,
         }),
       ).pipe(Effect.andThen(runtime.cancel)),
-      steer: (text) =>
+      startSteer: (text) =>
         Effect.gen(function* () {
           const started = yield* runtime.start();
           const fiber = yield* runtime
@@ -100,29 +105,37 @@ export const makeHermesAcpRuntime = (
             } satisfies EffectAcpSchema.PromptRequest)
             .pipe(Effect.forkIn(scope));
           steerFibers.add(fiber);
-          const response = yield* Fiber.join(fiber).pipe(
-            Effect.catchCause(
-              (cause): Effect.Effect<unknown, EffectAcpErrors.AcpError> =>
-                Cause.hasInterruptsOnly(cause)
-                  ? Effect.succeed({
-                      stopReason: "cancelled",
-                    } satisfies EffectAcpSchema.PromptResponse)
-                  : Effect.failCause(cause),
+          return {
+            cancel: Fiber.interrupt(fiber).pipe(
+              Effect.ensuring(Effect.sync(() => steerFibers.delete(fiber))),
+              Effect.asVoid,
             ),
-            // An abandoned steer must not leave its request fiber running in
-            // the runtime scope where cancel can no longer reach it.
-            Effect.onInterrupt(() => Fiber.interrupt(fiber).pipe(Effect.ignore)),
-            Effect.ensuring(Effect.sync(() => steerFibers.delete(fiber))),
-          );
-          return yield* decodeSteerPromptResponse(response).pipe(
-            Effect.mapError((cause) =>
-              EffectAcpErrors.AcpRequestError.internalError(
-                "Hermes returned an undecodable steer prompt response.",
-                undefined,
-                { cause },
+            result: Fiber.join(fiber).pipe(
+              Effect.catchCause(
+                (cause): Effect.Effect<unknown, EffectAcpErrors.AcpError> =>
+                  Cause.hasInterruptsOnly(cause)
+                    ? Effect.succeed({
+                        stopReason: "cancelled",
+                      } satisfies EffectAcpSchema.PromptResponse)
+                    : Effect.failCause(cause),
+              ),
+              // An abandoned steer must not leave its request fiber running in
+              // the runtime scope where cancel can no longer reach it.
+              Effect.onInterrupt(() => Fiber.interrupt(fiber).pipe(Effect.ignore)),
+              Effect.ensuring(Effect.sync(() => steerFibers.delete(fiber))),
+              Effect.flatMap((response) =>
+                decodeSteerPromptResponse(response).pipe(
+                  Effect.mapError((cause) =>
+                    EffectAcpErrors.AcpRequestError.internalError(
+                      "Hermes returned an undecodable steer prompt response.",
+                      undefined,
+                      { cause },
+                    ),
+                  ),
+                ),
               ),
             ),
-          );
+          };
         }),
       setSessionMode: (modeId) =>
         Effect.gen(function* () {

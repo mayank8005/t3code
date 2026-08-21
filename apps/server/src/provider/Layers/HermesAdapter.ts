@@ -850,12 +850,33 @@ export function makeHermesAdapter(
               // in-flight prompt resolving first cannot settle the turn
               // while the steer is still streaming.
               ctx.promptsInFlight += 1;
+              for (let yieldAttempt = 0; yieldAttempt < 8; yieldAttempt += 1) {
+                yield* Effect.yieldNow;
+              }
+              if (ctx.interruptedTurnIds.has(steeringTurnId)) {
+                return yield* new ProviderAdapterRequestError({
+                  provider: PROVIDER,
+                  method: "session/prompt",
+                  detail: "Hermes steering was interrupted during preparation.",
+                });
+              }
+              const steerRequest = yield* ctx.acp.startSteer(text).pipe(
+                Effect.mapError((error) =>
+                  mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
+                ),
+                Effect.tapError(() =>
+                  settlePromptInFlight(input.threadId, steeringTurnId, ctx.acpSessionId, {
+                    errorMessage: "Hermes steering prompt failed.",
+                  }),
+                ),
+              );
               return {
                 _tag: "Steer" as const,
                 acp: ctx.acp,
                 acpSessionId: ctx.acpSessionId,
                 turnId: steeringTurnId,
                 text,
+                steerRequest,
                 resumeCursor: ctx.session.resumeCursor,
               };
             }
@@ -996,9 +1017,11 @@ export function makeHermesAdapter(
           }),
         );
         if (prepared._tag === "Steer") {
-          const steerSettled = yield* Ref.make(false);
+          const steerSettled = yield* Ref.make(false).pipe(
+            Effect.onInterrupt(() => prepared.steerRequest.cancel),
+          );
           return yield* Effect.gen(function* () {
-            const result = yield* prepared.acp.steer(prepared.text).pipe(
+            const result = yield* prepared.steerRequest.result.pipe(
               Effect.mapError((error) =>
                 mapAcpToAdapterError(PROVIDER, input.threadId, "session/prompt", error),
               ),
@@ -1050,6 +1073,7 @@ export function makeHermesAdapter(
               resumeCursor: prepared.resumeCursor,
             };
           }).pipe(
+            Effect.onInterrupt(() => prepared.steerRequest.cancel),
             Effect.ensuring(
               Effect.gen(function* () {
                 if (yield* Ref.get(steerSettled)) {
