@@ -100,7 +100,8 @@ choice — Hermes asks about file edits with allow-once or deny only — and tho
 each.
 
 Older Hermes builds may not offer these edit-approval modes. When that happens, T3 Code leaves
-Hermes on its default and every prompt surfaces for approval as usual.
+Hermes on its default ask-before-edits behavior: in Full access the extra prompts are still
+answered for you automatically, and in every other mode they surface for approval as usual.
 
 ## Troubleshooting
 
