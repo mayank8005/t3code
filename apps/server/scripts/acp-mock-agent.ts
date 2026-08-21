@@ -23,6 +23,8 @@ const emitXAiPromptCompleteThenHang = process.env.T3_ACP_EMIT_XAI_PROMPT_COMPLET
 const emitForeignSessionUpdates = process.env.T3_ACP_EMIT_FOREIGN_SESSION_UPDATES === "1";
 const hangPromptForever = process.env.T3_ACP_HANG_PROMPT_FOREVER === "1";
 const hangFirstPromptForever = process.env.T3_ACP_HANG_FIRST_PROMPT_FOREVER === "1";
+const hangPromptUntilSteer = process.env.T3_ACP_HANG_PROMPT_UNTIL_STEER === "1";
+const emitMessageThenHang = process.env.T3_ACP_EMIT_MESSAGE_THEN_HANG === "1";
 const emitLateUpdateAfterCancel = process.env.T3_ACP_EMIT_LATE_UPDATE_AFTER_CANCEL === "1";
 const omitXAiPromptCompleteStopReason =
   process.env.T3_ACP_OMIT_XAI_PROMPT_COMPLETE_STOP_REASON === "1";
@@ -58,6 +60,8 @@ let currentContext = "272k";
 let currentFast = false;
 let promptCount = 0;
 let overlappingFirstPromptId: string | undefined;
+let steerReleased = false;
+let releaseHangingPrompt: (() => void) | undefined;
 const cancelledSessions = new Set<string>();
 
 function promptIdFromRequestMeta(
@@ -69,6 +73,11 @@ function promptIdFromRequestMeta(
   }
   const promptId = meta.promptId ?? meta.requestId;
   return typeof promptId === "string" && promptId.length > 0 ? promptId : undefined;
+}
+
+function firstPromptText(request: Pick<AcpSchema.PromptRequest, "prompt">): string | undefined {
+  const part = request.prompt.find((entry) => entry.type === "text");
+  return part?.type === "text" ? part.text : undefined;
 }
 
 function logExit(reason: string): void {
@@ -536,6 +545,49 @@ const program = Effect.gen(function* () {
       }
 
       if (hangPromptForever || (hangFirstPromptForever && promptCount === 1)) {
+        return yield* Effect.never;
+      }
+
+      if (hangPromptUntilSteer) {
+        if (firstPromptText(request)?.startsWith("/steer ")) {
+          yield* agent.client.sessionUpdate({
+            sessionId: requestedSessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "steered output" },
+            },
+          });
+          steerReleased = true;
+          releaseHangingPrompt?.();
+          releaseHangingPrompt = undefined;
+          return { stopReason: "end_turn" };
+        }
+        if (!steerReleased) {
+          yield* Effect.promise(
+            () =>
+              new Promise<void>((resolve) => {
+                releaseHangingPrompt = resolve;
+              }),
+          );
+        }
+        yield* agent.client.sessionUpdate({
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: promptResponseText ?? "hello from mock" },
+          },
+        });
+        return { stopReason: "end_turn" };
+      }
+
+      if (emitMessageThenHang) {
+        yield* agent.client.sessionUpdate({
+          sessionId: requestedSessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: promptResponseText ?? "hello from mock" },
+          },
+        });
         return yield* Effect.never;
       }
 

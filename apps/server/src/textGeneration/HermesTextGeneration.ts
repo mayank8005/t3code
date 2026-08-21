@@ -9,6 +9,7 @@ import { sanitizeBranchFragment, sanitizeFeatureBranchName } from "@t3tools/shar
 import { extractJsonObject } from "@t3tools/shared/schemaJson";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 
+import { resolveHermesAcpModelId } from "../provider/acp/HermesAcpSupport.ts";
 import * as TextGeneration from "./TextGeneration.ts";
 import {
   buildBranchNamePrompt,
@@ -33,20 +34,19 @@ type TextGenerationOperation =
   | "generateThreadTitle";
 
 function resolveHermesModelArgs(model: string): ReadonlyArray<string> {
-  const trimmed = model.trim();
-  const normalized = trimmed.toLowerCase();
-  if (!trimmed || normalized === "default" || normalized === "auto") {
+  const selected = resolveHermesAcpModelId(model);
+  if (selected === undefined) {
     return [];
   }
-  const separatorIndex = trimmed.indexOf(":");
-  if (separatorIndex <= 0 || separatorIndex === trimmed.length - 1) {
-    return ["--model", trimmed];
+  const separatorIndex = selected.indexOf(":");
+  if (separatorIndex <= 0 || separatorIndex === selected.length - 1) {
+    return ["--model", selected];
   }
   return [
     "--provider",
-    trimmed.slice(0, separatorIndex),
+    selected.slice(0, separatorIndex),
     "--model",
-    trimmed.slice(separatorIndex + 1),
+    selected.slice(separatorIndex + 1),
   ];
 }
 

@@ -66,6 +66,10 @@ to use, then authenticate it.
 Cursor is the one to watch: install Cursor CLI, which provides the `cursor-agent` binary that
 T3 Code looks for, but authenticate with `agent login`, not `cursor-agent login`.
 
+Hermes needs one extra step: T3 Code talks to Hermes over ACP, which is an optional extra. After
+installing the CLI, run `cd ~/.hermes/hermes-agent && uv pip install -e '.[acp]'` once, or T3 Code
+will not be able to start Hermes. See [Hermes](./providers-hermes.md) for the full setup.
+
 Run the login command on the machine running the T3 Code server, not on the device you browse
 from.
 

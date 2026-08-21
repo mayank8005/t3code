@@ -242,7 +242,7 @@ it.layer(hermesAdapterTestLayer)("HermesAdapterLive", (it) => {
       const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
       const wrapperPath = yield* Effect.promise(() =>
         makeMockHermesWrapper({
-          T3_ACP_PROMPT_DELAY_MS: "1000",
+          T3_ACP_HANG_PROMPT_UNTIL_STEER: "1",
           T3_ACP_REQUEST_LOG_PATH: requestLogPath,
         }),
       );
@@ -317,6 +317,56 @@ it.layer(hermesAdapterTestLayer)("HermesAdapterLive", (it) => {
 
       yield* adapter.stopSession(threadId);
     }).pipe(TestClock.withLive),
+  );
+
+  it.effect("records no turn transcript when sendTurn is interrupted before settling", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("hermes-send-turn-interrupt-mid-stream");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockHermesWrapper({ T3_ACP_EMIT_MESSAGE_THEN_HANG: "1" }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const contentDelta = yield* Deferred.make<void>();
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        event.type === "content.delta" ? Deferred.succeed(contentDelta, undefined) : Effect.void,
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("hermes"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+
+      const sendTurnFiber = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "interrupt mid-stream",
+          attachments: [],
+        })
+        .pipe(Effect.forkChild);
+
+      yield* Deferred.await(contentDelta);
+      for (let yieldAttempt = 0; yieldAttempt < 6; yieldAttempt += 1) {
+        yield* Effect.yieldNow;
+      }
+      yield* Fiber.interrupt(sendTurnFiber);
+      for (let yieldAttempt = 0; yieldAttempt < 4; yieldAttempt += 1) {
+        yield* Effect.yieldNow;
+      }
+
+      // Hermes turn records settle with the prompt response; an interrupt
+      // before settlement leaves no phantom turn behind and frees the session.
+      const snapshot = yield* adapter.readThread(threadId);
+      assert.lengthOf(snapshot.turns, 0);
+      const session = (yield* adapter.listSessions()).find(
+        (candidate) => candidate.threadId === threadId,
+      );
+      assert.isUndefined(session?.activeTurnId);
+
+      yield* Fiber.interrupt(runtimeEventsFiber);
+      yield* adapter.stopSession(threadId);
+    }),
   );
 
   it.effect("authenticates with the advertised provider method and sets the requested model", () =>
