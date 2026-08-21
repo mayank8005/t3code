@@ -265,23 +265,29 @@ function availableModels(): ReadonlyArray<{
   }));
 }
 
-const availableModes: ReadonlyArray<AcpSchema.SessionMode> = [
-  {
-    id: "ask",
-    name: "Ask",
-    description: "Request permission before making any changes",
-  },
-  {
-    id: "architect",
-    name: "Architect",
-    description: "Design and plan software systems without implementation",
-  },
-  {
-    id: "code",
-    name: "Code",
-    description: "Write and modify code with full tool access",
-  },
-];
+const availableModesJson = process.env.T3_ACP_AVAILABLE_MODES;
+const availableModes: ReadonlyArray<AcpSchema.SessionMode> = availableModesJson
+  ? (JSON.parse(availableModesJson) as ReadonlyArray<AcpSchema.SessionMode>)
+  : [
+      {
+        id: "ask",
+        name: "Ask",
+        description: "Request permission before making any changes",
+      },
+      {
+        id: "architect",
+        name: "Architect",
+        description: "Design and plan software systems without implementation",
+      },
+      {
+        id: "code",
+        name: "Code",
+        description: "Write and modify code with full tool access",
+      },
+    ];
+if (availableModesJson) {
+  currentModeId = availableModes[0]?.id ?? currentModeId;
+}
 
 function modeState(): AcpSchema.SessionModeState {
   return {
@@ -966,7 +972,7 @@ const program = Effect.gen(function* () {
       });
     }
 
-    if (method !== "session/mode/set") {
+    if (method !== "session/mode/set" && method !== "session/set_mode") {
       return Effect.fail(AcpError.AcpRequestError.methodNotFound(method));
     }
 

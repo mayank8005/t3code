@@ -56,6 +56,7 @@ import {
   applyHermesAcpModelSelection,
   currentHermesModelIdFromSessionSetup,
   makeHermesAcpRuntime,
+  resolveHermesAcpModeId,
   resolveHermesAcpModelId,
   type HermesAcpRuntime,
 } from "../acp/HermesAcpSupport.ts";
@@ -637,6 +638,21 @@ export function makeHermesAdapter(
               mapAcpToAdapterError(PROVIDER, input.threadId, "session/start", error),
             ),
           );
+
+          const requestedModeId = resolveHermesAcpModeId(input.runtimeMode);
+          const advertisedModes = started.sessionSetupResult.modes?.availableModes ?? [];
+          if (
+            requestedModeId !== undefined &&
+            advertisedModes.some((mode) => mode.id === requestedModeId)
+          ) {
+            yield* acp
+              .setSessionMode(requestedModeId)
+              .pipe(
+                Effect.mapError((cause) =>
+                  mapAcpToAdapterError(PROVIDER, input.threadId, "session/set_mode", cause),
+                ),
+              );
+          }
 
           const requestedStartModelId = resolveHermesAcpModelId(hermesModelSelection?.model);
           const sessionDefaultModelId = currentHermesModelIdFromSessionSetup(

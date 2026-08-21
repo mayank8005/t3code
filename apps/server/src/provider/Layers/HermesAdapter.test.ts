@@ -47,6 +47,11 @@ const HERMES_SETUP_ONLY_AUTH_METHODS_JSON = JSON.stringify([
 ]);
 const DEFAULT_MODEL_ID = "openrouter:qwen/qwen3-coder";
 const ALT_MODEL_ID = "openrouter:moonshotai/kimi-k2";
+const HERMES_AVAILABLE_MODES_JSON = JSON.stringify([
+  { id: "default", name: "Default", description: "Ask before edits." },
+  { id: "accept_edits", name: "Accept Edits", description: "Auto-allow workspace edits." },
+  { id: "dont_ask", name: "Don't Ask", description: "Skip edit approvals for the session." },
+]);
 
 async function makeMockHermesWrapper(extraEnv?: Record<string, string>) {
   const dir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "hermes-acp-mock-"));
@@ -418,8 +423,8 @@ it.layer(hermesAdapterTestLayer)("HermesAdapterLive", (it) => {
           .map((entry) => entry.params?.modelId),
         [ALT_MODEL_ID],
       );
-      // Hermes has no ACP modes and exposes no config options: the adapter
-      // must never reach for either surface.
+      // This mock advertises no Hermes edit-policy modes and no config
+      // options: the adapter must not reach for either surface.
       assert.notInclude(methods, "session/set_mode");
       assert.notInclude(methods, "session/mode/set");
       assert.notInclude(methods, "session/set_config_option");
@@ -844,6 +849,47 @@ it.layer(hermesAdapterTestLayer)("HermesAdapterLive", (it) => {
 
       yield* Fiber.interrupt(eventsFiber);
       yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("maps runtime modes onto Hermes' advertised edit-approval modes", () =>
+    Effect.gen(function* () {
+      const tempDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "hermes-acp-modes-")),
+      );
+      const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockHermesWrapper({
+          T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+          T3_ACP_AVAILABLE_MODES: HERMES_AVAILABLE_MODES_JSON,
+        }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+
+      const startWithRuntimeMode = (
+        threadId: ThreadId,
+        runtimeMode: "auto-accept-edits" | "full-access" | "approval-required",
+      ) =>
+        adapter
+          .startSession({
+            threadId,
+            provider: ProviderDriverKind.make("hermes"),
+            cwd: process.cwd(),
+            runtimeMode,
+          })
+          .pipe(Effect.andThen(adapter.stopSession(threadId)));
+
+      yield* startWithRuntimeMode(ThreadId.make("hermes-mode-auto-accept"), "auto-accept-edits");
+      yield* startWithRuntimeMode(ThreadId.make("hermes-mode-full-access"), "full-access");
+      yield* startWithRuntimeMode(ThreadId.make("hermes-mode-supervised"), "approval-required");
+
+      const requests = yield* Effect.promise(() => readJsonLines(requestLogPath));
+      assert.deepEqual(
+        requests
+          .filter((entry) => entry.method === "session/set_mode")
+          .map((entry) => entry.params?.modeId),
+        ["accept_edits", "dont_ask"],
+      );
     }),
   );
 

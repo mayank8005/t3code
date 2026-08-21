@@ -7,6 +7,7 @@ import {
   applyHermesAcpModelSelection,
   buildHermesAcpSpawnInput,
   resolveHermesAcpAuthMethodId,
+  resolveHermesAcpModeId,
   resolveHermesAcpModelId,
 } from "./HermesAcpSupport.ts";
 
@@ -123,6 +124,15 @@ describe("resolveHermesAcpModelId", () => {
       "openrouter:moonshotai/kimi-k2",
     );
     expect(resolveHermesAcpModelId("nous:Hermes-4-405B")).toBe("nous:Hermes-4-405B");
+  });
+});
+
+describe("resolveHermesAcpModeId", () => {
+  it("maps edit-accepting runtime modes onto Hermes modes and leaves supervised alone", () => {
+    expect(resolveHermesAcpModeId("auto-accept-edits")).toBe("accept_edits");
+    expect(resolveHermesAcpModeId("auto")).toBe("accept_edits");
+    expect(resolveHermesAcpModeId("full-access")).toBe("dont_ask");
+    expect(resolveHermesAcpModeId("approval-required")).toBeUndefined();
   });
 });
 

@@ -1,4 +1,4 @@
-import { type HermesSettings } from "@t3tools/contracts";
+import { type HermesSettings, type RuntimeMode } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -30,6 +30,7 @@ export type HermesAcpRuntime = AcpSessionRuntime.AcpSessionRuntime["Service"] & 
   readonly steer: (
     text: string,
   ) => Effect.Effect<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError>;
+  readonly setSessionMode: (modeId: string) => Effect.Effect<void, EffectAcpErrors.AcpError>;
 };
 
 export function buildHermesAcpSpawnInput(
@@ -108,6 +109,9 @@ export const makeHermesAcpRuntime = (
                     } satisfies EffectAcpSchema.PromptResponse)
                   : Effect.failCause(cause),
             ),
+            // An abandoned steer must not leave its request fiber running in
+            // the runtime scope where cancel can no longer reach it.
+            Effect.onInterrupt(() => Fiber.interrupt(fiber).pipe(Effect.ignore)),
             Effect.ensuring(Effect.sync(() => steerFibers.delete(fiber))),
           );
           return yield* decodeSteerPromptResponse(response).pipe(
@@ -120,8 +124,31 @@ export const makeHermesAcpRuntime = (
             ),
           );
         }),
+      setSessionMode: (modeId) =>
+        Effect.gen(function* () {
+          const started = yield* runtime.start();
+          // Hermes maps edit-approval policy onto ACP session modes and only
+          // honors the session/set_mode surface, not a "mode" config option.
+          yield* runtime.request("session/set_mode", {
+            sessionId: started.sessionId,
+            modeId,
+          });
+        }),
     };
   });
+
+/** Hermes maps edit-approval policy onto ACP modes; supervised keeps its default. */
+export function resolveHermesAcpModeId(runtimeMode: RuntimeMode): string | undefined {
+  switch (runtimeMode) {
+    case "auto-accept-edits":
+    case "auto":
+      return "accept_edits";
+    case "full-access":
+      return "dont_ask";
+    default:
+      return undefined;
+  }
+}
 
 /** The default and auto sentinels keep Hermes' session-selected model. */
 export function resolveHermesAcpModelId(model: string | null | undefined): string | undefined {

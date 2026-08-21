@@ -84,14 +84,23 @@ with `hermes setup` in a terminal and try again.
 Hermes has no plan mode, so the composer's Chat/Plan toggle is hidden for Hermes threads. The
 [permission mode](./permission-modes.md) control is still there and still matters.
 
-In every mode except **Full access**, each permission prompt Hermes raises — file edits, sensitive
-paths, and anything else it asks about — surfaces in T3 Code and waits for you to approve or reject
-it.
+In **Supervised**, Hermes stays on its default ask-before-edits behavior: every permission prompt it
+raises — file edits, sensitive paths, and anything else it asks about — surfaces in T3 Code and
+waits for you to approve or reject it.
 
-In **Full access**, T3 Code answers those prompts for you by selecting Hermes' session-scoped
-`allow_session` option. The approval lasts only for the active Hermes session; T3 Code never adds
-permissions to Hermes' permanent allowlist. Some prompts offer no session-scoped choice — Hermes
-asks about file edits with allow-once or deny only — and those are allowed once each.
+In **Auto-accept edits** and **Auto**, T3 Code puts Hermes in its accept-edits mode. Hermes then
+applies edits inside your workspace and `/tmp` without asking, and still prompts for sensitive
+paths outside them.
+
+In **Full access**, T3 Code puts Hermes in its no-prompt mode, so it does not ask about edits for
+the rest of the session. T3 Code also answers any prompt Hermes still raises by selecting its
+session-scoped `allow_session` option. The approval lasts only for the active Hermes session; T3
+Code never adds permissions to Hermes' permanent allowlist. Some prompts offer no session-scoped
+choice — Hermes asks about file edits with allow-once or deny only — and those are allowed once
+each.
+
+Older Hermes builds may not offer these edit-approval modes. When that happens, T3 Code leaves
+Hermes on its default and every prompt surfaces for approval as usual.
 
 ## Troubleshooting
 
