@@ -143,6 +143,43 @@ it.layer(HermesTextGenerationTestLayer)("HermesTextGeneration", (it) => {
     );
   });
 
+  it.effect("splits provider prefixes without corrupting named custom endpoints", () => {
+    const argsDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3code-hermes-model-ids-"));
+    const argsPath = NodePath.join(argsDir, "args");
+    const generateWithModel = (
+      textGeneration: Parameters<Parameters<typeof withFakeHermes>[1]>[0],
+      model: string,
+    ) =>
+      textGeneration
+        .generateThreadTitle({
+          cwd: process.cwd(),
+          message: "anything",
+          modelSelection: createModelSelection(ProviderInstanceId.make("hermes"), model),
+        })
+        .pipe(Effect.map(() => readArgs(argsPath)));
+    const providerAndModel = (args: ReadonlyArray<string>) =>
+      args.slice(args.indexOf("--provider"), args.indexOf("--provider") + 4);
+    return withFakeHermes(
+      { argsPath, output: JSON.stringify({ title: "Model routing" }) },
+      (textGeneration) =>
+        Effect.gen(function* () {
+          // Hermes names custom endpoints custom:name:model.
+          expect(
+            providerAndModel(yield* generateWithModel(textGeneration, "custom:local:qwen3.5:27b")),
+          ).toEqual(["--provider", "custom:local", "--model", "qwen3.5:27b"]);
+          expect(providerAndModel(yield* generateWithModel(textGeneration, "custom:qwen"))).toEqual(
+            ["--provider", "custom", "--model", "qwen"],
+          );
+          // Ids without a usable provider prefix pass through --model whole.
+          const bare = yield* generateWithModel(textGeneration, "qwen3-coder");
+          expect(bare).toContain("qwen3-coder");
+          expect(bare).not.toContain("--provider");
+          expect(yield* generateWithModel(textGeneration, ":foo")).toContain(":foo");
+          expect(yield* generateWithModel(textGeneration, "foo:")).toContain("foo:");
+        }),
+    );
+  });
+
   it.effect("extracts JSON from conversational output", () =>
     withFakeHermes(
       {

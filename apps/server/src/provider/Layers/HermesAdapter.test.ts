@@ -322,8 +322,15 @@ it.layer(hermesAdapterTestLayer)("HermesAdapterLive", (it) => {
   it.effect("records no turn transcript when sendTurn is interrupted before settling", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("hermes-send-turn-interrupt-mid-stream");
+      const tempDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "hermes-acp-interrupt-")),
+      );
+      const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
       const wrapperPath = yield* Effect.promise(() =>
-        makeMockHermesWrapper({ T3_ACP_EMIT_MESSAGE_THEN_HANG: "1" }),
+        makeMockHermesWrapper({
+          T3_ACP_EMIT_MESSAGE_THEN_HANG: "1",
+          T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+        }),
       );
       const adapter = yield* makeTestAdapter(wrapperPath);
       const contentDelta = yield* Deferred.make<void>();
@@ -356,17 +363,19 @@ it.layer(hermesAdapterTestLayer)("HermesAdapterLive", (it) => {
       }
 
       // Hermes turn records settle with the prompt response; an interrupt
-      // before settlement leaves no phantom turn behind and frees the session.
+      // before settlement leaves no phantom turn behind, frees the session,
+      // and tells Hermes to stop executing the abandoned turn.
       const snapshot = yield* adapter.readThread(threadId);
       assert.lengthOf(snapshot.turns, 0);
       const session = (yield* adapter.listSessions()).find(
         (candidate) => candidate.threadId === threadId,
       );
       assert.isUndefined(session?.activeTurnId);
+      yield* waitForFileContent(requestLogPath, 40, "session/cancel");
 
       yield* Fiber.interrupt(runtimeEventsFiber);
       yield* adapter.stopSession(threadId);
-    }),
+    }).pipe(TestClock.withLive),
   );
 
   it.effect("authenticates with the advertised provider method and sets the requested model", () =>
@@ -832,6 +841,50 @@ it.layer(hermesAdapterTestLayer)("HermesAdapterLive", (it) => {
 
       const requests = yield* Effect.promise(() => readJsonLines(requestLogPath));
       assert.deepEqual(selectedPermissionOptionIds(requests), ["allow_session"]);
+
+      yield* Fiber.interrupt(eventsFiber);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("falls back to allow-once when a session approval offers no session option", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("hermes-edit-approval-session-fallback");
+      const tempDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "hermes-acp-edit-approval-")),
+      );
+      const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
+      // Hermes edit approvals offer only allow-once/deny; "always allow this
+      // session" must degrade to allow-once instead of cancelling.
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockHermesWrapper({
+          T3_ACP_REQUEST_LOG_PATH: requestLogPath,
+          T3_ACP_EMIT_TOOL_CALLS: "1",
+          T3_ACP_ALLOW_SESSION_OPTION_ID: "",
+          T3_ACP_ALLOW_ALWAYS_OPTION_ID: "",
+        }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        event.type === "request.opened"
+          ? adapter.respondToRequest(
+              threadId,
+              ApprovalRequestId.make(String(event.requestId)),
+              "acceptForSession",
+            )
+          : Effect.void,
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("hermes"),
+        cwd: process.cwd(),
+        runtimeMode: "approval-required",
+      });
+      yield* adapter.sendTurn({ threadId, input: "edit the file", attachments: [] });
+
+      const requests = yield* Effect.promise(() => readJsonLines(requestLogPath));
+      assert.deepEqual(selectedPermissionOptionIds(requests), ["allow_once"]);
 
       yield* Fiber.interrupt(eventsFiber);
       yield* adapter.stopSession(threadId);

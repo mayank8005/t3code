@@ -753,11 +753,15 @@ const program = Effect.gen(function* () {
                   },
                 ]
               : []),
-            {
-              optionId: permissionOptionIds.allowAlways,
-              name: "Allow always",
-              kind: "allow_always",
-            },
+            ...(permissionOptionIds.allowAlways
+              ? [
+                  {
+                    optionId: permissionOptionIds.allowAlways,
+                    name: "Allow always",
+                    kind: "allow_always" as const,
+                  },
+                ]
+              : []),
             { optionId: permissionOptionIds.rejectOnce, name: "Reject", kind: "reject_once" },
           ],
         });

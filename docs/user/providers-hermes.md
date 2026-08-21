@@ -16,8 +16,8 @@ Install the [Hermes Agent](https://hermes-agent.nousresearch.com/docs/) CLI:
 curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
 ```
 
-T3 Code talks to Hermes over ACP, which is an optional extra. Install it once, or T3 Code will not
-be able to start Hermes:
+That installer includes Hermes' ACP support, so there is nothing else to install for T3 Code. If you
+installed Hermes some other way, without its `[all]` extra, add ACP support yourself:
 
 ```bash
 cd ~/.hermes/hermes-agent && uv pip install -e '.[acp]'
@@ -90,7 +90,8 @@ it.
 
 In **Full access**, T3 Code answers those prompts for you by selecting Hermes' session-scoped
 `allow_session` option. The approval lasts only for the active Hermes session; T3 Code never adds
-permissions to Hermes' permanent allowlist.
+permissions to Hermes' permanent allowlist. Some prompts offer no session-scoped choice — Hermes
+asks about file edits with allow-once or deny only — and those are allowed once each.
 
 ## Troubleshooting
 
@@ -102,7 +103,8 @@ inherit, the absolute path is the quicker fix.
 
 **"Hermes is installed without ACP support. Install the ACP extra..."**
 
-Hermes runs, but its ACP server does not. This is almost always the missing ACP extra:
+Hermes runs, but its ACP server does not. This is almost always a Hermes installed without its
+`[all]` extra, which is the one that brings ACP along. Add the extra directly:
 
 ```bash
 cd ~/.hermes/hermes-agent && uv pip install -e '.[acp]'

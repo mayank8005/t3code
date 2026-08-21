@@ -22,7 +22,7 @@ We wanted something performant, remote-ready, and truly open. If we ever go the 
 > - Hermes: install [Hermes Agent](https://hermes-agent.nousresearch.com/docs/) with `curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash` and run `hermes setup`
 > - OpenCode: install [OpenCode](https://opencode.ai) and run `opencode auth login`
 >
-> T3 Code talks to Hermes over ACP, which needs Hermes' ACP extra: `cd ~/.hermes/hermes-agent && uv pip install -e '.[acp]'`. See [Hermes](./docs/user/providers-hermes.md) for details.
+> T3 Code talks to Hermes over ACP. The Hermes installer above includes ACP support already; only a manual install without Hermes' `[all]` extra needs `cd ~/.hermes/hermes-agent && uv pip install -e '.[acp]'`. See [Hermes](./docs/user/providers-hermes.md) for details.
 
 ### Try it out (install-free)
 

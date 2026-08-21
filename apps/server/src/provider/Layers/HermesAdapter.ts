@@ -147,14 +147,18 @@ function selectPermissionOptionId(
   request: EffectAcpSchema.RequestPermissionRequest,
   decision: Exclude<ProviderApprovalDecision, "cancel">,
 ): string | undefined {
-  const kind =
-    decision === "acceptForSession"
-      ? "allow_always"
-      : decision === "accept"
-        ? "allow_once"
-        : "reject_once";
-  const option = request.options.find((entry) => entry.kind === kind);
-  return option?.optionId.trim() || undefined;
+  const byKind = (kind: EffectAcpSchema.PermissionOption["kind"]) =>
+    request.options.find((entry) => entry.kind === kind)?.optionId.trim() || undefined;
+  if (decision === "acceptForSession") {
+    // Hermes keeps session scope in the option id (ACP has no session kind),
+    // and its edit-only prompts offer just allow-once/deny; degrade to a
+    // one-shot allow rather than cancelling the user's approval.
+    const sessionOptionId = request.options
+      .find((entry) => entry.optionId.trim() === "allow_session")
+      ?.optionId.trim();
+    return sessionOptionId ?? byKind("allow_always") ?? byKind("allow_once");
+  }
+  return byKind(decision === "accept" ? "allow_once" : "reject_once");
 }
 
 function selectAutoApprovedPermissionOption(
@@ -1186,6 +1190,17 @@ export function makeHermesAdapter(
             }),
           );
         }).pipe(
+          // A prompt abandoned by fiber interruption must also stop Hermes:
+          // the RPC fiber dies client-side only, and without a session/cancel
+          // the agent keeps executing and can leak into the next turn.
+          Effect.onInterrupt(() =>
+            Effect.gen(function* () {
+              if (yield* Ref.get(promptRpcSucceeded)) {
+                return;
+              }
+              yield* Effect.ignore(interruptTurn(input.threadId, prepared.turnId));
+            }),
+          ),
           Effect.ensuring(
             Effect.gen(function* () {
               if (yield* Ref.get(promptSettled)) {

@@ -111,8 +111,12 @@ export const makeHermesAcpRuntime = (
             Effect.ensuring(Effect.sync(() => steerFibers.delete(fiber))),
           );
           return yield* decodeSteerPromptResponse(response).pipe(
-            Effect.orElseSucceed(
-              (): EffectAcpSchema.PromptResponse => ({ stopReason: "end_turn" }),
+            Effect.mapError((cause) =>
+              EffectAcpErrors.AcpRequestError.internalError(
+                "Hermes returned an undecodable steer prompt response.",
+                undefined,
+                { cause },
+              ),
             ),
           );
         }),

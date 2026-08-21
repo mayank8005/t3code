@@ -42,12 +42,18 @@ function resolveHermesModelArgs(model: string): ReadonlyArray<string> {
   if (separatorIndex <= 0 || separatorIndex === selected.length - 1) {
     return ["--model", selected];
   }
-  return [
-    "--provider",
-    selected.slice(0, separatorIndex),
-    "--model",
-    selected.slice(separatorIndex + 1),
-  ];
+  let provider = selected.slice(0, separatorIndex);
+  let modelId = selected.slice(separatorIndex + 1);
+  // Hermes names custom endpoints with a second id segment:
+  // custom:local:qwen3 selects provider custom:local, model qwen3.
+  if (provider === "custom") {
+    const nestedIndex = modelId.indexOf(":");
+    if (nestedIndex > 0 && nestedIndex < modelId.length - 1) {
+      provider = `custom:${modelId.slice(0, nestedIndex)}`;
+      modelId = modelId.slice(nestedIndex + 1);
+    }
+  }
+  return ["--provider", provider, "--model", modelId];
 }
 
 export const makeHermesTextGeneration = Effect.fn("makeHermesTextGeneration")(function* (
